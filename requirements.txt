@@ -1,2 +1,2 @@
-python-telegram-bot==20.7
-ortools==9.7.2996
+python-telegram-bot>=20.7
+ortools>=9.7
