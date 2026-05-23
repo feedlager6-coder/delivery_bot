@@ -42,9 +42,16 @@ def route_done_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def help_keyboard() -> InlineKeyboardMarkup:
+def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📖 Как пользоваться", callback_data="help")],
+        [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+        [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
+    ])
+
+
+def start_route_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
     ])
 
 HOW_TO_GET_LINK = (
@@ -174,18 +181,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if saved:
         await update.message.reply_text(
-            "🚀 Начинаем маршрут.\n\n"
-            "Стартовая точка сохранена с прошлого раза.\n"
+            "👋 С возвращением!\n"
+            "Стартовая точка сохранена.\n"
             "Стартуем снова отсюда? (да/нет)",
         )
         return CONFIRM_START
     else:
         await update.message.reply_text(
-            "Привет! 🚀 Начинаем маршрут.\n\n"
-            "Сначала отправь ссылку на место старта\n"
-            "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
+            "👋 Привет! Я бот для оптимизации маршрутов доставки.\n\n"
+            "🚗 <b>Что я умею:</b>\n"
+            "• Строю оптимальный маршрут объезда\n"
+            "• Экономлю топливо и время курьера\n"
+            "• Показываю маршрут в Яндекс Навигаторе\n\n"
+            "📊 <b>Реальная польза:</b>\n"
+            "• Экономия 20–30% пути на каждом маршруте\n"
+            "• Чем больше доставок — тем больше экономия\n"
+            "• Курьер успевает больше заказов за день\n\n"
+            "💡 Пример: при 10 доставках в день\n"
+            "экономия может составить от 3 000 до 15 000 руб.\n"
+            "в месяц только на топливе\n\n"
+            "Яндекс Карты едут в том порядке как ты добавил точки — "
+            "я нахожу лучший порядок сам 🧠\n\n"
+            "Готов начать? 👇",
             parse_mode="HTML",
-            reply_markup=help_keyboard(),
+            reply_markup=welcome_keyboard(),
         )
         return WAITING_FOR_START
 
@@ -397,7 +416,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
 
-    if query.data == "new":
+    if query.data == "start_route":
+        context.user_data.pop("deliveries", None)
+        await query.message.reply_text(
+            "Отправь ссылку на место старта\n"
+            "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+    elif query.data == "how_to":
+        await query.message.reply_text(
+            "📖 <b>Как пользоваться ботом:</b>\n\n"
+            "1️⃣ Нажми <b>Начать маршрут</b>\n"
+            "2️⃣ Открой Яндекс Карты\n"
+            "3️⃣ Зажми палец на точке старта\n"
+            "4️⃣ Нажми Поделиться → скопируй ссылку\n"
+            "5️⃣ Отправь ссылку боту\n"
+            "6️⃣ Повтори для каждой точки доставки\n"
+            "7️⃣ Напиши <b>Готово</b>\n"
+            "8️⃣ Получи оптимальный маршрут! 🎉\n\n"
+            "Подсказка: ссылка выглядит так:\n"
+            "<code>https://yandex.ru/maps/?whatshere...</code>",
+            parse_mode="HTML",
+            reply_markup=start_route_keyboard(),
+        )
+        return WAITING_FOR_START
+
+    elif query.data == "new":
         context.user_data.pop("deliveries", None)
         saved = context.user_data.get("старт")
         if saved:
