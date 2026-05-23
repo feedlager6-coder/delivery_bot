@@ -202,12 +202,15 @@ async def handle_confirm_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     text = update.message.text.strip().lower()
-    if text in ("да", "yes", "д", "+"):
+    logger.info("Confirm start: got '%s' (repr: %r)", text, text)
+    if text in ("да", "yes", "д", "+", "y", "ага", "ок", "ok", "1"):
         context.user_data["deliveries"] = []
+        logger.info("User %s confirmed start, moving to WAITING_FOR_DELIVERY", update.effective_user.id)
         await _ask_for_delivery(update, context, first=True)
         return WAITING_FOR_DELIVERY
     else:
         context.user_data.pop("старт", None)
+        logger.info("User %s declined start, moving to WAITING_FOR_START", update.effective_user.id)
         await update.message.reply_text(
             "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
