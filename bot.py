@@ -2,6 +2,7 @@ import os
 import math
 import logging
 import random
+import json
 import urllib.request
 import urllib.parse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,6 +25,81 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 AVG_SPEED_KMH = 30
+
+geocode_cache: dict[str, str] = {}
+
+
+def cache_key(lat: float, lon: float) -> str:
+    return f"{round(lat, 4)},{round(lon, 4)}"
+
+
+def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
+    key = cache_key(lat, lon)
+
+    if key in geocode_cache:
+        logger.info("Address for %s: %s (cache)", key, geocode_cache[key])
+        return geocode_cache[key]
+
+    # Nominatim (бесплатно, приоритет)
+    try:
+        url = (
+            "https://nominatim.openstreetmap.org/reverse?"
+            f"lat={lat}&lon={lon}"
+            "&format=json&accept-language=ru"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "delivery-bot-1.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        addr = data.get("address", {})
+        road = addr.get("road", "")
+        house = addr.get("house_number", "")
+        if road:
+            result = f"{road}, {house}" if house else road
+            geocode_cache[key] = result
+            logger.info("Address for %s: %s (nominatim)", key, result)
+            return result
+    except Exception as e:
+        logger.warning("Nominatim failed for %s: %s", key, e)
+
+    # Яндекс (запасной)
+    if yandex_key:
+        try:
+            url = (
+                "https://geocode-maps.yandex.ru/1.x/?"
+                f"apikey={yandex_key}&geocode={lon},{lat}"
+                "&format=json&results=1&lang=ru_RU&kind=house"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            members = (
+                data.get("response", {})
+                .get("GeoObjectCollection", {})
+                .get("featureMember", [])
+            )
+            if members:
+                name = (
+                    members[0]
+                    .get("GeoObject", {})
+                    .get("metaDataProperty", {})
+                    .get("GeocoderMetaData", {})
+                    .get("text", "")
+                )
+                if name:
+                    parts = name.split(", ")
+                    result = ", ".join(parts[-2:]) if len(parts) >= 2 else name
+                    geocode_cache[key] = result
+                    logger.info("Address for %s: %s (yandex)", key, result)
+                    return result
+        except Exception as e:
+            logger.warning("Yandex geocoder failed for %s: %s", key, e)
+
+    # Запасной — координаты
+    result = f"{lat:.5f}, {lon:.5f}"
+    geocode_cache[key] = result
+    logger.info("Address for %s: %s (coords)", key, result)
+    return result
+
 
 WAITING_FOR_START = 1
 WAITING_FOR_DELIVERY = 2
@@ -304,8 +380,10 @@ async def _ask_for_delivery(
             parse_mode="HTML",
         )
     else:
+        addresses = context.user_data.get("delivery_addresses", [])
+        addr = addresses[n - 1] if n <= len(addresses) else f"точка {n}"
         await update.message.reply_text(
-            f"📍 Точка {n} добавлена!\n"
+            f"📍 <b>{addr}</b> добавлена!\n"
             "Отправь следующую ссылку или напиши <b>Готово</b>",
             parse_mode="HTML",
         )
@@ -339,11 +417,14 @@ async def handle_delivery_link(
         logger.info("User %s hit delivery limit (50)", update.effective_user.id)
         return WAITING_FOR_DELIVERY
 
+    address = get_address(coord[0], coord[1], os.environ.get("YANDEX_KEY"))
     deliveries.append(coord)
+    context.user_data.setdefault("delivery_addresses", []).append(address)
     logger.info(
-        "User %s added delivery point #%d, state=WAITING_FOR_DELIVERY",
+        "User %s added delivery point #%d (%s), state=WAITING_FOR_DELIVERY",
         update.effective_user.id,
         len(deliveries),
+        address,
     )
     await _ask_for_delivery(update, context, first=False)
     return WAITING_FOR_DELIVERY
@@ -370,6 +451,8 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     savings_km = max(0.0, random_km - total_km)
     time_min = int(total_km / AVG_SPEED_KMH * 60)
 
+    delivery_addresses = context.user_data.get("delivery_addresses", [])
+
     seen = set()
     delivery_steps = []
     for i in route_order:
@@ -377,8 +460,14 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             delivery_steps.append(i)
             seen.add(i)
 
+    def label(delivery_index: int) -> str:
+        addr_idx = delivery_index - 1
+        if 0 <= addr_idx < len(delivery_addresses):
+            return delivery_addresses[addr_idx]
+        return f"точка {delivery_index}"
+
     numbered = "\n".join(
-        f"{idx + 1}. Точка {i}" for idx, i in enumerate(delivery_steps)
+        f"{idx + 1}. {label(i)}" for idx, i in enumerate(delivery_steps)
     )
 
     yandex_url = build_yandex_nav_url(all_coords, route_order)
@@ -409,6 +498,7 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     await status_msg.edit_text(result, parse_mode="HTML", reply_markup=route_done_keyboard())
     context.user_data.pop("deliveries", None)
+    context.user_data.pop("delivery_addresses", None)
     return ConversationHandler.END
 
 
