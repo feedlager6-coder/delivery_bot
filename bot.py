@@ -4,9 +4,10 @@ import logging
 import random
 import urllib.request
 import urllib.parse
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
@@ -27,6 +28,24 @@ AVG_SPEED_KMH = 30
 WAITING_FOR_START = 1
 WAITING_FOR_DELIVERY = 2
 CONFIRM_START = 3
+
+
+def route_done_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"),
+            InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome"),
+        ],
+        [
+            InlineKeyboardButton("📖 Помощь", callback_data="help"),
+        ],
+    ])
+
+
+def help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📖 Как пользоваться", callback_data="help")],
+    ])
 
 HOW_TO_GET_LINK = (
     "Как получить ссылку из Яндекс Карт:\n"
@@ -166,6 +185,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "Сначала отправь ссылку на место старта\n"
             "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=help_keyboard(),
         )
         return WAITING_FOR_START
 
@@ -368,8 +388,55 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"🗺 <b>Открыть в навигаторе:</b>\n{yandex_url}"
     )
 
-    await status_msg.edit_text(result, parse_mode="HTML")
+    await status_msg.edit_text(result, parse_mode="HTML", reply_markup=route_done_keyboard())
     context.user_data.pop("deliveries", None)
+    return ConversationHandler.END
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "new":
+        context.user_data.pop("deliveries", None)
+        saved = context.user_data.get("старт")
+        if saved:
+            await query.message.reply_text(
+                "🔄 Новый маршрут!\n\n"
+                "Стартуем снова отсюда? (да/нет)"
+            )
+            return CONFIRM_START
+        else:
+            await query.message.reply_text(
+                "🔄 Новый маршрут!\n\n"
+                "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+                parse_mode="HTML",
+            )
+            return WAITING_FOR_START
+
+    elif query.data == "changehome":
+        context.user_data.pop("deliveries", None)
+        await query.message.reply_text(
+            "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+    elif query.data == "help":
+        await query.message.reply_text(
+            "📖 <b>Как пользоваться ботом:</b>\n\n"
+            "1. /start — начать новый маршрут\n"
+            "2. Отправь ссылку стартовой точки из Яндекс Карт\n"
+            "3. Отправляй ссылки точек доставки по одной\n"
+            "4. Напиши <b>Готово</b> — получи оптимальный маршрут\n\n"
+            "<b>Команды:</b>\n"
+            "/new — новый маршрут (старт сохраняется)\n"
+            "/changehome — изменить стартовую точку\n"
+            "/help — эта справка\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return ConversationHandler.END
+
     return ConversationHandler.END
 
 
@@ -414,6 +481,7 @@ def main() -> None:
             CommandHandler("start", cmd_start),
             CommandHandler("new", cmd_new),
             CommandHandler("changehome", cmd_changehome),
+            CallbackQueryHandler(button_handler),
         ],
         states={
             CONFIRM_START: [
@@ -432,6 +500,7 @@ def main() -> None:
             CommandHandler("start", cmd_start),
             CommandHandler("new", cmd_new),
             CommandHandler("changehome", cmd_changehome),
+            CallbackQueryHandler(button_handler),
             MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler),
         ],
         allow_reentry=True,
