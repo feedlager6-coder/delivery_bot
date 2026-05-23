@@ -10,6 +10,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -288,14 +289,20 @@ async def handle_delivery_link(
         return WAITING_FOR_DELIVERY
 
     deliveries = context.user_data.setdefault("deliveries", [])
-    if len(deliveries) >= 19:
+    if len(deliveries) >= 50:
         await update.message.reply_text(
-            "⚠️ Максимум 19 точек доставки. Напиши <b>Готово</b> для расчёта.",
+            "⚠️ Максимум 50 точек доставки. Напиши <b>Готово</b> для расчёта.",
             parse_mode="HTML",
         )
+        logger.info("User %s hit delivery limit (50)", update.effective_user.id)
         return WAITING_FOR_DELIVERY
 
     deliveries.append(coord)
+    logger.info(
+        "User %s added delivery point #%d, state=WAITING_FOR_DELIVERY",
+        update.effective_user.id,
+        len(deliveries),
+    )
     await _ask_for_delivery(update, context, first=False)
     return WAITING_FOR_DELIVERY
 
@@ -369,12 +376,35 @@ async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def delivery_state_unknown_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Перехватывает неизвестные команды внутри WAITING_FOR_DELIVERY — не даёт выпасть из диалога."""
+    deliveries = context.user_data.get("deliveries", [])
+    logger.info(
+        "User %s sent unknown command in WAITING_FOR_DELIVERY, points so far: %d",
+        update.effective_user.id,
+        len(deliveries),
+    )
+    await update.message.reply_text(
+        f"📍 Уже добавлено точек: <b>{len(deliveries)}</b>\n"
+        "Отправь ссылку из Яндекс Карт или напиши <b>Готово</b>",
+        parse_mode="HTML",
+    )
+    return WAITING_FOR_DELIVERY
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling update: %s", context.error, exc_info=context.error)
+
+
 def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN environment variable is not set")
 
-    app = Application.builder().token(token).build()
+    persistence = PicklePersistence(filepath="bot_persistence.pkl")
+    app = Application.builder().token(token).persistence(persistence).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -390,20 +420,25 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_link)
             ],
             WAITING_FOR_DELIVERY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link),
+                # перехватываем любые команды внутри состояния — не выпадаем из диалога
+                MessageHandler(filters.COMMAND, delivery_state_unknown_cmd),
             ],
         },
         fallbacks=[
             CommandHandler("start", cmd_start),
             CommandHandler("new", cmd_new),
             CommandHandler("changehome", cmd_changehome),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler),
         ],
         allow_reentry=True,
+        name="route_conversation",
+        persistent=True,
     )
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler))
+    app.add_error_handler(error_handler)
 
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
