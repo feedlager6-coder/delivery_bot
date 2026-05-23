@@ -643,12 +643,15 @@ def main() -> None:
         ],
         states={
             CONFIRM_START: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm_start)
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm_start),
             ],
             WAITING_FOR_START: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_link)
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_link),
             ],
             WAITING_FOR_DELIVERY: [
+                CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link),
                 # перехватываем любые команды внутри состояния — не выпадаем из диалога
                 MessageHandler(filters.COMMAND, delivery_state_unknown_cmd),
