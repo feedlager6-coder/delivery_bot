@@ -17,8 +17,7 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,10 @@ def haversine_meters(c1: tuple[float, float], c2: tuple[float, float]) -> int:
     lat1, lon1 = math.radians(c1[0]), math.radians(c1[1])
     lat2, lon2 = math.radians(c2[0]), math.radians(c2[1])
     dlat, dlon = lat2 - lat1, lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
     return int(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 
@@ -80,7 +82,9 @@ def build_distance_matrix(coords: list[tuple[float, float]]) -> list[list[int]]:
     ]
 
 
-def solve_tsp_with_start(all_coords: list[tuple[float, float]]) -> tuple[list[int], int]:
+def solve_tsp_with_start(
+    all_coords: list[tuple[float, float]],
+) -> tuple[list[int], int]:
     n = len(all_coords)
     if n == 2:
         dist = haversine_meters(all_coords[0], all_coords[1])
@@ -97,8 +101,12 @@ def solve_tsp_with_start(all_coords: list[tuple[float, float]]) -> tuple[list[in
     routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    params.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
     params.time_limit.seconds = 5
 
     solution = routing.SolveWithParameters(params)
@@ -127,7 +135,9 @@ def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
     return total / 1000
 
 
-def build_yandex_nav_url(coords: list[tuple[float, float]], route_order: list[int]) -> str:
+def build_yandex_nav_url(
+    coords: list[tuple[float, float]], route_order: list[int]
+) -> str:
     seen = set()
     unique = []
     for i in route_order:
@@ -153,8 +163,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             "Привет! 🚀 Начинаем маршрут.\n\n"
             "Сначала отправь ссылку на место старта\n"
-            "(склад, офис или дом)\n\n"
-            + HOW_TO_GET_LINK,
+            "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
         )
         return WAITING_FOR_START
@@ -173,8 +182,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     else:
         await update.message.reply_text(
             "🔄 Новый маршрут!\n\n"
-            "Отправь ссылку на место старта.\n\n"
-            + HOW_TO_GET_LINK,
+            "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
         )
         return WAITING_FOR_START
@@ -189,7 +197,9 @@ async def cmd_changehome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return WAITING_FOR_START
 
 
-async def handle_confirm_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_confirm_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     text = update.message.text.strip().lower()
     if text in ("да", "yes", "д", "+"):
         context.user_data["deliveries"] = []
@@ -215,8 +225,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Команды:</b>\n"
         "/new — новый маршрут (старт сохраняется)\n"
         "/changehome — изменить стартовую точку\n"
-        "/help — эта справка\n\n"
-        + HOW_TO_GET_LINK,
+        "/help — эта справка\n\n" + HOW_TO_GET_LINK,
         parse_mode="HTML",
     )
 
@@ -248,8 +257,7 @@ async def _ask_for_delivery(
     if first:
         await update.message.reply_text(
             "Теперь отправляй ссылки точек доставки по одной.\n"
-            "Когда добавишь все — напиши <b>Готово</b>\n\n"
-            + HOW_TO_GET_LINK,
+            "Когда добавишь все — напиши <b>Готово</b>\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
         )
     else:
@@ -260,7 +268,9 @@ async def _ask_for_delivery(
         )
 
 
-async def handle_delivery_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_delivery_link(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     text = update.message.text.strip()
 
     if text.lower() in ("готово", "готов", "go", "done"):
@@ -295,8 +305,7 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     if not deliveries:
         await update.message.reply_text(
-            "⚠️ Ты не добавил ни одной точки доставки.\n"
-            "Отправь ссылку из Яндекс Карт."
+            "⚠️ Ты не добавил ни одной точки доставки.\nОтправь ссылку из Яндекс Карт."
         )
         return WAITING_FOR_DELIVERY
 
@@ -325,13 +334,27 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     yandex_url = build_yandex_nav_url(all_coords, route_order)
 
+    if savings_km > 0:
+        day_savings = round(savings_km * 12)
+        month_savings = round(day_savings * 30)
+        year_savings = round(month_savings * 12)
+        savings_block = (
+            f"💰 Экономия: <b>{savings_km:.1f} км</b>\n"
+            f"⛽️ Экономия топлива:\n"
+            f"   ~{day_savings} руб. в день\n"
+            f"   ~{month_savings} руб. в месяц\n"
+            f"   ~{year_savings} руб. в год\n\n"
+        )
+    else:
+        savings_block = ""
+
     result = (
         "🚀 Старт сохранён\n\n"
         f"📍 <b>Оптимальный маршрут:</b>\n{numbered}\n"
         "🏁 Возврат на старт\n\n"
         f"📏 Расстояние: <b>{total_km:.1f} км</b>\n"
         f"⏱ Время: <b>{time_min} мин</b> (30 км/ч)\n"
-        f"💰 Экономия: <b>{savings_km:.1f} км</b>\n\n"
+        + savings_block +
         f"🗺 <b>Открыть в навигаторе:</b>\n{yandex_url}"
     )
 
