@@ -142,6 +142,23 @@ HOW_TO_GET_LINK = (
 
 def parse_yandex_link(url: str) -> tuple[float, float] | None:
     try:
+        # Раскрываем короткие ссылки-редиректы (yandex.ru/maps/-/...)
+        if "maps/-/" in url or "maps.yandex" in url:
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    method="HEAD",
+                )
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPRedirectHandler()
+                )
+                response = opener.open(req, timeout=5)
+                url = response.geturl()
+                logger.info("Resolved short link to: %s", url)
+            except Exception as e:
+                logger.warning("Failed to resolve short link '%s': %s", url, e)
+
         decoded_url = urllib.parse.unquote(url)
         parsed = urllib.parse.urlparse(decoded_url)
         params = urllib.parse.parse_qs(parsed.query)
@@ -362,6 +379,7 @@ async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return WAITING_FOR_START
 
     context.user_data["старт"] = coord
+    context.user_data["старт_адрес"] = get_address(coord[0], coord[1], os.environ.get("YANDEX_KEY"))
     context.user_data["deliveries"] = []
     await update.message.reply_text("✅ Стартовая точка сохранена!")
     await _ask_for_delivery(update, context, first=True)
@@ -535,11 +553,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data == "new":
         context.user_data.pop("deliveries", None)
+        context.user_data.pop("delivery_addresses", None)
         saved = context.user_data.get("старт")
         if saved:
+            saved_addr = context.user_data.get("старт_адрес", "сохранённая точка")
             await query.message.reply_text(
-                "🔄 Новый маршрут!\n\n"
-                "Стартуем снова отсюда? (да/нет)"
+                "🔄 Новый маршрут! Точки сброшены.\n\n"
+                f"Стартуем снова отсюда?\n"
+                f"📍 {saved_addr}\n\n"
+                "(да/нет)"
             )
             return CONFIRM_START
         else:
