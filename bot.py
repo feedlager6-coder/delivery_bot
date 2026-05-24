@@ -104,6 +104,7 @@ def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
 WAITING_FOR_START = 1
 WAITING_FOR_DELIVERY = 2
 CONFIRM_START = 3
+WAITING_FOR_COURIERS = 4
 
 
 def route_done_keyboard() -> InlineKeyboardMarkup:
@@ -253,6 +254,39 @@ def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
         for i in range(len(order) - 1)
     )
     return total / 1000
+
+
+def distribute_routes(
+    deliveries: list[tuple[float, float]],
+    delivery_addresses: list[str],
+    num_couriers: int,
+) -> list[tuple[list[tuple[float, float]], list[str]]]:
+    """Делит точки доставки на N групп по углу от центра."""
+    n = len(deliveries)
+    padded_addrs = delivery_addresses + [""] * n
+    pairs = list(zip(deliveries, padded_addrs))
+
+    if num_couriers == 1:
+        return [(deliveries, list(delivery_addresses))]
+
+    if num_couriers >= n:
+        return [([p[0]], [p[1]]) for p in pairs]
+
+    center_lat = sum(p[0][0] for p in pairs) / n
+    center_lon = sum(p[0][1] for p in pairs) / n
+
+    sorted_pairs = sorted(
+        pairs,
+        key=lambda p: math.atan2(p[0][0] - center_lat, p[0][1] - center_lon),
+    )
+
+    size = math.ceil(n / num_couriers)
+    groups = []
+    for i in range(num_couriers):
+        chunk = sorted_pairs[i * size:(i + 1) * size]
+        if chunk:
+            groups.append(([c[0] for c in chunk], [c[1] for c in chunk]))
+    return groups
 
 
 def build_yandex_nav_url(
@@ -413,7 +447,18 @@ async def handle_delivery_link(
     text = update.message.text.strip()
 
     if text.lower() in ("готово", "готов", "go", "done"):
-        return await finish_route(update, context)
+        deliveries = context.user_data.get("deliveries", [])
+        if not deliveries:
+            await update.message.reply_text(
+                "⚠️ Ты не добавил ни одной точки доставки.\nОтправь ссылку из Яндекс Карт."
+            )
+            return WAITING_FOR_DELIVERY
+        await update.message.reply_text(
+            "👥 Сколько курьеров?\n"
+            "Напиши число от 1 до 10\n\n"
+            "(1 — один оптимальный маршрут)"
+        )
+        return WAITING_FOR_COURIERS
 
     coord = parse_yandex_link(text)
     if not coord:
@@ -448,75 +493,111 @@ async def handle_delivery_link(
     return WAITING_FOR_DELIVERY
 
 
+async def handle_couriers_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    try:
+        n = int(text)
+        if n < 1 or n > 10:
+            await update.message.reply_text("Напиши число от 1 до 10")
+            return WAITING_FOR_COURIERS
+    except ValueError:
+        await update.message.reply_text(
+            "Не понял. Напиши просто число, например: 3"
+        )
+        return WAITING_FOR_COURIERS
+
+    context.user_data["num_couriers"] = n
+    return await finish_route(update, context)
+
+
 async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     deliveries: list[tuple[float, float]] = context.user_data.get("deliveries", [])
-
-    if not deliveries:
-        await update.message.reply_text(
-            "⚠️ Ты не добавил ни одной точки доставки.\nОтправь ссылку из Яндекс Карт."
-        )
-        return WAITING_FOR_DELIVERY
-
-    status_msg = await update.message.reply_text("⚙️ Оптимизирую маршрут...")
-
+    delivery_addresses: list[str] = context.user_data.get("delivery_addresses", [])
+    num_couriers: int = context.user_data.get("num_couriers", 1)
     start_coord = context.user_data["старт"]
-    all_coords = [start_coord] + deliveries
 
-    route_order, total_meters = solve_tsp_with_start(all_coords)
-    random_km = random_route_distance(all_coords)
-
-    total_km = total_meters / 1000
-    savings_km = max(0.0, random_km - total_km)
-    time_min = int(total_km / AVG_SPEED_KMH * 60)
-
-    delivery_addresses = context.user_data.get("delivery_addresses", [])
-
-    seen = set()
-    delivery_steps = []
-    for i in route_order:
-        if i != 0 and i not in seen:
-            delivery_steps.append(i)
-            seen.add(i)
-
-    def label(delivery_index: int) -> str:
-        addr_idx = delivery_index - 1
-        if 0 <= addr_idx < len(delivery_addresses):
-            return delivery_addresses[addr_idx]
-        return f"точка {delivery_index}"
-
-    numbered = "\n".join(
-        f"{idx + 1}. {label(i)}" for idx, i in enumerate(delivery_steps)
+    status_msg = await update.message.reply_text(
+        f"⚙️ Считаю маршруты для {num_couriers} курьера(ов)..."
     )
 
-    yandex_url = build_yandex_nav_url(all_coords, route_order)
+    groups = distribute_routes(deliveries, delivery_addresses, num_couriers)
+
+    total_km_all = 0.0
+    total_min_all = 0
+    courier_blocks: list[str] = []
+
+    for courier_idx, (group_coords, group_addrs) in enumerate(groups, 1):
+        all_coords = [start_coord] + group_coords
+        route_order, total_meters = solve_tsp_with_start(all_coords)
+        total_km = total_meters / 1000
+        time_min = int(total_km / AVG_SPEED_KMH * 60)
+        total_km_all += total_km
+        total_min_all += time_min
+
+        seen: set[int] = set()
+        delivery_steps: list[int] = []
+        for i in route_order:
+            if i != 0 and i not in seen:
+                delivery_steps.append(i)
+                seen.add(i)
+
+        numbered = "\n".join(
+            f"{pos}. {group_addrs[step - 1] if 0 <= step - 1 < len(group_addrs) else f'точка {step}'}"
+            for pos, step in enumerate(delivery_steps, 1)
+        )
+
+        yandex_url = build_yandex_nav_url(all_coords, route_order)
+
+        if num_couriers == 1:
+            courier_blocks.append(
+                f"📍 <b>Оптимальный маршрут:</b>\n{numbered}\n"
+                f"🏁 Возврат на старт\n\n"
+                f"📏 Расстояние: <b>{total_km:.1f} км</b>\n"
+                f"⏱ Время: <b>{time_min} мин</b> (30 км/ч)\n"
+                f"🗺 <b>Открыть в навигаторе:</b>\n{yandex_url}"
+            )
+        else:
+            courier_blocks.append(
+                f"🚗 <b>Курьер {courier_idx}</b> — {len(group_coords)} точек:\n"
+                f"{numbered}\n"
+                f"📏 {total_km:.1f} км • ⏱ {time_min} мин\n"
+                f'🗺 <a href="{yandex_url}">Маршрут курьера {courier_idx}</a>'
+            )
+
+    # Экономия относительно случайного порядка всех точек
+    random_km = random_route_distance([start_coord] + deliveries)
+    savings_km = max(0.0, random_km - total_km_all)
+
+    if num_couriers == 1:
+        header = "🚀 Маршрут готов!\n\n"
+        footer = ""
+    else:
+        header = f"👥 Маршруты для {num_couriers} курьеров готовы!\n\n"
+        footer = (
+            f"\n\n📊 Итого: <b>{total_km_all:.1f} км</b> • <b>{total_min_all} мин</b>\n"
+        )
 
     if savings_km > 0:
         day_savings = round(savings_km * 12)
-        month_savings = round(day_savings * 30)
-        year_savings = round(month_savings * 12)
-        savings_block = (
-            f"💰 Экономия: <b>{savings_km:.1f} км</b>\n"
-            f"⛽️ Экономия топлива:\n"
-            f"   ~{day_savings} руб. в день\n"
-            f"   ~{month_savings} руб. в месяц\n"
-            f"   ~{year_savings} руб. в год\n\n"
-        )
-    else:
-        savings_block = ""
+        if num_couriers == 1:
+            month_savings = round(day_savings * 30)
+            year_savings = round(month_savings * 12)
+            footer += (
+                f"💰 Экономия: <b>{savings_km:.1f} км</b>\n"
+                f"⛽️ Экономия топлива:\n"
+                f"   ~{day_savings} руб. в день\n"
+                f"   ~{month_savings} руб. в месяц\n"
+                f"   ~{year_savings} руб. в год\n"
+            )
+        else:
+            footer += f"💰 Экономия: <b>{savings_km:.1f} км</b> (~{day_savings} руб/день)\n"
 
-    result = (
-        "🚀 Старт сохранён\n\n"
-        f"📍 <b>Оптимальный маршрут:</b>\n{numbered}\n"
-        "🏁 Возврат на старт\n\n"
-        f"📏 Расстояние: <b>{total_km:.1f} км</b>\n"
-        f"⏱ Время: <b>{time_min} мин</b> (30 км/ч)\n"
-        + savings_block +
-        f"🗺 <b>Открыть в навигаторе:</b>\n{yandex_url}"
-    )
+    result = header + "\n\n".join(courier_blocks) + footer
 
     await status_msg.edit_text(result, parse_mode="HTML", reply_markup=route_done_keyboard())
     context.user_data.pop("deliveries", None)
     context.user_data.pop("delivery_addresses", None)
+    context.user_data.pop("num_couriers", None)
     return ConversationHandler.END
 
 
@@ -655,6 +736,10 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link),
                 # перехватываем любые команды внутри состояния — не выпадаем из диалога
                 MessageHandler(filters.COMMAND, delivery_state_unknown_cmd),
+            ],
+            WAITING_FOR_COURIERS: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_couriers_input),
             ],
         },
         fallbacks=[
