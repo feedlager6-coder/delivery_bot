@@ -241,9 +241,14 @@ def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
     return total / 1000
 
 
+def coords_key(coord: tuple[float, float]) -> str:
+    """Ключ координаты с точностью до 3 знаков — для дедупликации."""
+    return f"{round(coord[0], 3)},{round(coord[1], 3)}"
+
+
 def expand_short_url(url: str) -> str:
-    """Раскрывает короткие ссылки Яндекс Карт через GET-запрос."""
-    if "maps/-/" not in url and "maps.yandex" not in url:
+    """Раскрывает редиректы Яндекс Карт через GET-запрос."""
+    if "yandex.ru/maps" not in url:
         return url
     try:
         req = urllib.request.Request(
@@ -271,16 +276,19 @@ def distribute_routes(
     delivery_addresses: list[str],
     num_couriers: int,
 ) -> list[tuple[list[tuple[float, float]], list[str]]]:
-    """Делит точки доставки на N групп по углу от центра."""
+    """Делит точки доставки на N групп по углу от центра (равномерно)."""
     n = len(deliveries)
-    padded_addrs = delivery_addresses + [""] * n
-    # zip берёт min(len) — обе длины одинаковы благодаря padded_addrs
-    pairs = list(zip(deliveries, padded_addrs))[:n]
+    if n == 0:
+        return []
 
-    if num_couriers == 1:
+    padded_addrs = (delivery_addresses + [""] * n)[:n]
+    pairs = list(zip(deliveries, padded_addrs))
+
+    # Не создаём больше групп, чем точек
+    actual_couriers = min(num_couriers, n)
+
+    if actual_couriers == 1:
         groups = [(deliveries, list(delivery_addresses))]
-    elif num_couriers >= n:
-        groups = [([p[0]], [p[1]]) for p in pairs]
     else:
         center_lat = sum(p[0][0] for p in pairs) / n
         center_lon = sum(p[0][1] for p in pairs) / n
@@ -290,18 +298,22 @@ def distribute_routes(
             key=lambda p: math.atan2(p[0][0] - center_lat, p[0][1] - center_lon),
         )
 
-        size = math.ceil(n / num_couriers)
+        base_size = n // actual_couriers
+        remainder = n % actual_couriers
         groups = []
-        for i in range(num_couriers):
-            chunk = sorted_pairs[i * size:(i + 1) * size]
+        idx = 0
+        for i in range(actual_couriers):
+            size = base_size + (1 if i < remainder else 0)
+            chunk = sorted_pairs[idx: idx + size]
+            idx += size
             if chunk:
                 groups.append(([c[0] for c in chunk], [c[1] for c in chunk]))
 
     total_assigned = sum(len(g[0]) for g in groups)
     if total_assigned != n:
         logger.error("distribute_routes: потеряны точки: %d != %d", total_assigned, n)
-    for i, (coords, _) in enumerate(groups):
-        logger.info("Курьер %d: %d точек", i + 1, len(coords))
+    for i, (grp_coords, _) in enumerate(groups):
+        logger.info("Курьер %d: %d точек", i + 1, len(grp_coords))
     return groups
 
 
@@ -497,7 +509,10 @@ async def handle_delivery_link(
         )
         return WAITING_FOR_DELIVERY
 
-    if coord == context.user_data.get("старт"):
+    new_key = coords_key(coord)
+
+    start = context.user_data.get("старт")
+    if start and coords_key(start) == new_key:
         await update.message.reply_text(
             "⚠️ Это твоя стартовая точка.\n"
             "Отправь ссылку на точку доставки."
@@ -505,6 +520,9 @@ async def handle_delivery_link(
         return WAITING_FOR_DELIVERY
 
     deliveries = context.user_data.setdefault("deliveries", [])
+    existing_keys = {coords_key(d) for d in deliveries}
+    if new_key in existing_keys:
+        return WAITING_FOR_DELIVERY
     if len(deliveries) >= 50:
         await update.message.reply_text(
             "⚠️ Максимум 50 точек доставки. Напиши <b>Готово</b> для расчёта.",
