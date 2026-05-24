@@ -431,6 +431,8 @@ async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["старт"] = coord
     context.user_data["старт_адрес"] = get_address(coord[0], coord[1], os.environ.get("YANDEX_KEY"))
     context.user_data["deliveries"] = []
+    context.user_data["delivery_addresses"] = []
+    context.user_data["processed_msgs"] = set()
     await update.message.reply_text("✅ Стартовая точка сохранена!")
     await _ask_for_delivery(update, context, first=True)
     return WAITING_FOR_DELIVERY
@@ -492,6 +494,13 @@ async def handle_delivery_link(
             "нажми Поделиться и скопируй ссылку.\n\n"
             "Или напиши <b>Готово</b> чтобы построить маршрут из уже добавленных точек.",
             parse_mode="HTML",
+        )
+        return WAITING_FOR_DELIVERY
+
+    if coord == context.user_data.get("старт"):
+        await update.message.reply_text(
+            "⚠️ Это твоя стартовая точка.\n"
+            "Отправь ссылку на точку доставки."
         )
         return WAITING_FOR_DELIVERY
 
