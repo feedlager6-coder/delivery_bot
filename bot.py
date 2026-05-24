@@ -143,22 +143,7 @@ HOW_TO_GET_LINK = (
 
 def parse_yandex_link(url: str) -> tuple[float, float] | None:
     try:
-        # Раскрываем короткие ссылки-редиректы (yandex.ru/maps/-/...)
-        if "maps/-/" in url or "maps.yandex" in url:
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    method="HEAD",
-                )
-                opener = urllib.request.build_opener(
-                    urllib.request.HTTPRedirectHandler()
-                )
-                response = opener.open(req, timeout=5)
-                url = response.geturl()
-                logger.info("Resolved short link to: %s", url)
-            except Exception as e:
-                logger.warning("Failed to resolve short link '%s': %s", url, e)
+        url = expand_short_url(url)
 
         decoded_url = urllib.parse.unquote(url)
         parsed = urllib.parse.urlparse(decoded_url)
@@ -256,6 +241,31 @@ def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
     return total / 1000
 
 
+def expand_short_url(url: str) -> str:
+    """Раскрывает короткие ссылки Яндекс Карт через GET-запрос."""
+    if "maps/-/" not in url and "maps.yandex" not in url:
+        return url
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15"
+                )
+            },
+            method="GET",
+        )
+        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+        response = opener.open(req, timeout=10)
+        final_url = response.geturl()
+        logger.info("Expanded short link: %s -> %s", url, final_url)
+        return final_url
+    except Exception as e:
+        logger.error("Failed to expand short link '%s': %s", url, e)
+        return url
+
+
 def distribute_routes(
     deliveries: list[tuple[float, float]],
     delivery_addresses: list[str],
@@ -264,28 +274,34 @@ def distribute_routes(
     """Делит точки доставки на N групп по углу от центра."""
     n = len(deliveries)
     padded_addrs = delivery_addresses + [""] * n
-    pairs = list(zip(deliveries, padded_addrs))
+    # zip берёт min(len) — обе длины одинаковы благодаря padded_addrs
+    pairs = list(zip(deliveries, padded_addrs))[:n]
 
     if num_couriers == 1:
-        return [(deliveries, list(delivery_addresses))]
+        groups = [(deliveries, list(delivery_addresses))]
+    elif num_couriers >= n:
+        groups = [([p[0]], [p[1]]) for p in pairs]
+    else:
+        center_lat = sum(p[0][0] for p in pairs) / n
+        center_lon = sum(p[0][1] for p in pairs) / n
 
-    if num_couriers >= n:
-        return [([p[0]], [p[1]]) for p in pairs]
+        sorted_pairs = sorted(
+            pairs,
+            key=lambda p: math.atan2(p[0][0] - center_lat, p[0][1] - center_lon),
+        )
 
-    center_lat = sum(p[0][0] for p in pairs) / n
-    center_lon = sum(p[0][1] for p in pairs) / n
+        size = math.ceil(n / num_couriers)
+        groups = []
+        for i in range(num_couriers):
+            chunk = sorted_pairs[i * size:(i + 1) * size]
+            if chunk:
+                groups.append(([c[0] for c in chunk], [c[1] for c in chunk]))
 
-    sorted_pairs = sorted(
-        pairs,
-        key=lambda p: math.atan2(p[0][0] - center_lat, p[0][1] - center_lon),
-    )
-
-    size = math.ceil(n / num_couriers)
-    groups = []
-    for i in range(num_couriers):
-        chunk = sorted_pairs[i * size:(i + 1) * size]
-        if chunk:
-            groups.append(([c[0] for c in chunk], [c[1] for c in chunk]))
+    total_assigned = sum(len(g[0]) for g in groups)
+    if total_assigned != n:
+        logger.error("distribute_routes: потеряны точки: %d != %d", total_assigned, n)
+    for i, (coords, _) in enumerate(groups):
+        logger.info("Курьер %d: %d точек", i + 1, len(coords))
     return groups
 
 
@@ -444,6 +460,14 @@ async def _ask_for_delivery(
 async def handle_delivery_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
+    msg_id = update.message.message_id
+    processed = context.user_data.setdefault("processed_msgs", set())
+    if msg_id in processed:
+        return WAITING_FOR_DELIVERY
+    processed.add(msg_id)
+    if len(processed) > 100:
+        context.user_data["processed_msgs"] = set()
+
     text = update.message.text.strip()
 
     if text.lower() in ("готово", "готов", "go", "done"):
