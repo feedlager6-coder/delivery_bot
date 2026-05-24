@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import logging
 import random
@@ -162,6 +163,10 @@ def parse_yandex_link(url: str) -> tuple[float, float] | None:
             if len(parts) >= 2:
                 return float(parts[0]), float(parts[1])
 
+        # Запасной вариант: ссылка на организацию — извлекаем координаты из HTML
+        if "/maps/org/" in url or "/maps/org/" in decoded_url:
+            return extract_coords_from_org_page(url)
+
         return None
     except Exception as e:
         logger.error(f"Link parse error for '{url}': {e}")
@@ -247,8 +252,8 @@ def coords_key(coord: tuple[float, float]) -> str:
 
 
 def expand_short_url(url: str) -> str:
-    """Раскрывает редиректы Яндекс Карт через GET-запрос."""
-    if "yandex.ru/maps" not in url:
+    """Раскрывает короткие ссылки yandex.ru/maps/-/... через GET-запрос."""
+    if "maps/-/" not in url:
         return url
     try:
         req = urllib.request.Request(
@@ -269,6 +274,26 @@ def expand_short_url(url: str) -> str:
     except Exception as e:
         logger.error("Failed to expand short link '%s': %s", url, e)
         return url
+
+
+def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
+    """Извлекает координаты из страницы организации Яндекс Карт по содержимому HTML."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read(500000).decode("utf-8", errors="ignore")
+        # "center":[lon, lat] — стандартный паттерн в JSON страницы организации
+        m = re.search(r'"center":\[(-?\d+\.?\d*),(-?\d+\.?\d*)\]', body)
+        if m:
+            lon, lat = float(m.group(1)), float(m.group(2))
+            logger.info("Extracted org coords from page body: lat=%.6f lon=%.6f", lat, lon)
+            return lat, lon
+    except Exception as e:
+        logger.warning("Failed to extract coords from org page '%s': %s", url, e)
+    return None
 
 
 def distribute_routes(
