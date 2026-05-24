@@ -1,6 +1,8 @@
 import os
 import re
 import math
+import signal
+import asyncio
 import logging
 import random
 import json
@@ -109,28 +111,35 @@ WAITING_FOR_COURIERS = 4
 
 
 def route_done_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"),
-            InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome"),
-        ],
-        [
-            InlineKeyboardButton("📖 Помощь", callback_data="help"),
-        ],
-    ])
+            [
+                InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"),
+                InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome"),
+            ],
+            [
+                InlineKeyboardButton("📖 Помощь", callback_data="help"),
+            ],
+        ]
+    )
 
 
 def welcome_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
-        [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+            [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
+        ]
+    )
 
 
 def start_route_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+        ]
+    )
+
 
 HOW_TO_GET_LINK = (
     "Как получить ссылку из Яндекс Карт:\n"
@@ -289,7 +298,9 @@ def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
         m = re.search(r'"center":\[(-?\d+\.?\d*),(-?\d+\.?\d*)\]', body)
         if m:
             lon, lat = float(m.group(1)), float(m.group(2))
-            logger.info("Extracted org coords from page body: lat=%.6f lon=%.6f", lat, lon)
+            logger.info(
+                "Extracted org coords from page body: lat=%.6f lon=%.6f", lat, lon
+            )
             return lat, lon
     except Exception as e:
         logger.warning("Failed to extract coords from org page '%s': %s", url, e)
@@ -329,7 +340,7 @@ def distribute_routes(
         idx = 0
         for i in range(actual_couriers):
             size = base_size + (1 if i < remainder else 0)
-            chunk = sorted_pairs[idx: idx + size]
+            chunk = sorted_pairs[idx : idx + size]
             idx += size
             if chunk:
                 groups.append(([c[0] for c in chunk], [c[1] for c in chunk]))
@@ -424,12 +435,18 @@ async def handle_confirm_start(
     logger.info("Confirm start: got '%s' (repr: %r)", text, text)
     if text in ("да", "yes", "д", "+", "y", "ага", "ок", "ok", "1"):
         context.user_data["deliveries"] = []
-        logger.info("User %s confirmed start, moving to WAITING_FOR_DELIVERY", update.effective_user.id)
+        logger.info(
+            "User %s confirmed start, moving to WAITING_FOR_DELIVERY",
+            update.effective_user.id,
+        )
         await _ask_for_delivery(update, context, first=True)
         return WAITING_FOR_DELIVERY
     else:
         context.user_data.pop("старт", None)
-        logger.info("User %s declined start, moving to WAITING_FOR_START", update.effective_user.id)
+        logger.info(
+            "User %s declined start, moving to WAITING_FOR_START",
+            update.effective_user.id,
+        )
         await update.message.reply_text(
             "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
@@ -456,7 +473,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
 
-    coord = parse_yandex_link(text)
+    coord = await asyncio.to_thread(parse_yandex_link, text)
     if not coord:
         await update.message.reply_text(
             "❌ Не смог прочитать ссылку.\n"
@@ -466,7 +483,9 @@ async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return WAITING_FOR_START
 
     context.user_data["старт"] = coord
-    context.user_data["старт_адрес"] = get_address(coord[0], coord[1], os.environ.get("YANDEX_KEY"))
+    context.user_data["старт_адрес"] = await asyncio.to_thread(
+        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
+    )
     context.user_data["deliveries"] = []
     context.user_data["delivery_addresses"] = []
     context.user_data["processed_msgs"] = set()
@@ -523,7 +542,7 @@ async def handle_delivery_link(
         )
         return WAITING_FOR_COURIERS
 
-    coord = parse_yandex_link(text)
+    coord = await asyncio.to_thread(parse_yandex_link, text)
     if not coord:
         await update.message.reply_text(
             "❌ Не смог прочитать ссылку.\n"
@@ -539,8 +558,7 @@ async def handle_delivery_link(
     start = context.user_data.get("старт")
     if start and coords_key(start) == new_key:
         await update.message.reply_text(
-            "⚠️ Это твоя стартовая точка.\n"
-            "Отправь ссылку на точку доставки."
+            "⚠️ Это твоя стартовая точка.\nОтправь ссылку на точку доставки."
         )
         return WAITING_FOR_DELIVERY
 
@@ -556,7 +574,9 @@ async def handle_delivery_link(
         logger.info("User %s hit delivery limit (50)", update.effective_user.id)
         return WAITING_FOR_DELIVERY
 
-    address = get_address(coord[0], coord[1], os.environ.get("YANDEX_KEY"))
+    address = await asyncio.to_thread(
+        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
+    )
     deliveries.append(coord)
     context.user_data.setdefault("delivery_addresses", []).append(address)
     logger.info(
@@ -569,7 +589,9 @@ async def handle_delivery_link(
     return WAITING_FOR_DELIVERY
 
 
-async def handle_couriers_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_couriers_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     text = update.message.text.strip()
     try:
         n = int(text)
@@ -577,9 +599,7 @@ async def handle_couriers_input(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("Напиши число от 1 до 10")
             return WAITING_FOR_COURIERS
     except ValueError:
-        await update.message.reply_text(
-            "Не понял. Напиши просто число, например: 3"
-        )
+        await update.message.reply_text("Не понял. Напиши просто число, например: 3")
         return WAITING_FOR_COURIERS
 
     context.user_data["num_couriers"] = n
@@ -666,11 +686,15 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 f"   ~{year_savings} руб. в год\n"
             )
         else:
-            footer += f"💰 Экономия: <b>{savings_km:.1f} км</b> (~{day_savings} руб/день)\n"
+            footer += (
+                f"💰 Экономия: <b>{savings_km:.1f} км</b> (~{day_savings} руб/день)\n"
+            )
 
     result = header + "\n\n".join(courier_blocks) + footer
 
-    await status_msg.edit_text(result, parse_mode="HTML", reply_markup=route_done_keyboard())
+    await status_msg.edit_text(
+        result, parse_mode="HTML", reply_markup=route_done_keyboard()
+    )
     context.user_data.pop("deliveries", None)
     context.user_data.pop("delivery_addresses", None)
     context.user_data.pop("num_couriers", None)
@@ -780,10 +804,25 @@ async def delivery_state_unknown_cmd(
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling update: %s", context.error, exc_info=context.error)
+    logger.error(
+        "Exception while handling update: %s", context.error, exc_info=context.error
+    )
 
 
 def main() -> None:
+    # Завершаем предыдущий экземпляр бота, чтобы избежать 409 Conflict
+    pid_file = "/tmp/bot_route.pid"
+    if os.path.exists(pid_file):
+        try:
+            old_pid = int(open(pid_file).read().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, signal.SIGTERM)
+                logger.info("Sent SIGTERM to old instance PID=%d", old_pid)
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN environment variable is not set")
