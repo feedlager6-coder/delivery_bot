@@ -13,6 +13,7 @@ from datetime import date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
@@ -1118,6 +1119,7 @@ async def pref_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="HTML",
         reply_markup=_prefs_keyboard(prefs),
     )
+    raise ApplicationHandlerStop
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1188,11 +1190,11 @@ def main() -> None:
         persistent=True,
     )
 
+    app.add_handler(CallbackQueryHandler(pref_callback_handler, pattern="^pref_"), group=-1)
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("route_prefs", cmd_route_prefs))
-    app.add_handler(CallbackQueryHandler(pref_callback_handler, pattern="^pref_"))
     app.add_error_handler(error_handler)
 
     logger.info("Bot started")
