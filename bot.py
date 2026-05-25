@@ -659,14 +659,6 @@ async def _ask_for_delivery(
 async def handle_delivery_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    msg_id = update.message.message_id
-    processed = context.user_data.setdefault("processed_msgs", set())
-    if msg_id in processed:
-        return WAITING_FOR_DELIVERY
-    processed.add(msg_id)
-    if len(processed) > 100:
-        context.user_data["processed_msgs"] = set()
-
     text = update.message.text.strip()
 
     if text.lower() in ("готово", "готов", "go", "done"):
@@ -882,10 +874,16 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+
+    _REMOVE_KB = {
+        "start_route", "new", "changehome",
+        "finish_points", "restart_yes", "restart_no",
+    }
+    if query.data in _REMOVE_KB or query.data.startswith("couriers_"):
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
     if query.data == "start_route":
         context.user_data.pop("deliveries", None)
