@@ -165,6 +165,20 @@ def finish_delivery_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def couriers_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1 курьер", callback_data="couriers_1"),
+            InlineKeyboardButton("2 курьера", callback_data="couriers_2"),
+            InlineKeyboardButton("3 курьера", callback_data="couriers_3"),
+        ],
+        [
+            InlineKeyboardButton("4 курьера", callback_data="couriers_4"),
+            InlineKeyboardButton("5 курьеров", callback_data="couriers_5"),
+        ],
+    ])
+
+
 HOW_TO_GET_LINK = (
     "Как получить ссылку из Яндекс Карт:\n"
     "1️⃣ Открой Яндекс Карты\n"
@@ -628,9 +642,8 @@ async def _ask_for_delivery(
     if first:
         await update.effective_message.reply_text(
             "Теперь отправляй ссылки точек доставки по одной.\n"
-            "Когда добавишь все — нажми кнопку или напиши <b>Готово</b>\n\n" + HOW_TO_GET_LINK,
+            "После первой точки появится кнопка <b>Построить маршрут</b>\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
-            reply_markup=finish_delivery_keyboard(),
         )
     else:
         addresses = context.user_data.get("delivery_addresses", [])
@@ -664,9 +677,8 @@ async def handle_delivery_link(
             )
             return WAITING_FOR_DELIVERY
         await update.message.reply_text(
-            "👥 Сколько курьеров?\n"
-            "Напиши число от 1 до 10\n\n"
-            "(1 — один оптимальный маршрут)"
+            "👥 Сколько курьеров?",
+            reply_markup=couriers_keyboard(),
         )
         return WAITING_FOR_COURIERS
 
@@ -750,11 +762,16 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     deliveries: list[tuple[float, float]] = context.user_data.get("deliveries", [])
     delivery_addresses: list[str] = context.user_data.get("delivery_addresses", [])
     num_couriers: int = context.user_data.get("num_couriers", 1)
-    start_coord = context.user_data["старт"]
+    start_coord = context.user_data.get("старт")
+    if not start_coord:
+        await update.effective_message.reply_text(
+            "⚠️ Стартовая точка не найдена. Запусти /start заново."
+        )
+        return ConversationHandler.END
 
     prefs = get_user_preferences(update.effective_user.id)
 
-    status_msg = await update.message.reply_text(
+    status_msg = await update.effective_message.reply_text(
         f"⚙️ Считаю маршруты для {num_couriers} курьера(ов)..."
     )
 
@@ -865,6 +882,10 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     if query.data == "start_route":
         context.user_data.pop("deliveries", None)
@@ -953,14 +974,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return WAITING_FOR_DELIVERY
         await query.message.reply_text(
-            "👥 Сколько курьеров?\n"
-            "Напиши число от 1 до 10\n\n"
-            "(1 — один оптимальный маршрут)"
+            "👥 Сколько курьеров?",
+            reply_markup=couriers_keyboard(),
         )
         return WAITING_FOR_COURIERS
 
+    elif query.data.startswith("couriers_"):
+        try:
+            n = int(query.data.split("_")[1])
+        except (ValueError, IndexError):
+            return WAITING_FOR_COURIERS
+        if n < 1 or n > 10:
+            return WAITING_FOR_COURIERS
+        context.user_data["num_couriers"] = n
+        prefs = get_user_preferences(update.effective_user.id)
+        prefs_lines = [
+            ("✅" if prefs["avoid_bad_roads"] else "❌") + " Избегать грунтовок",
+            ("✅" if prefs["avoid_narrow_roads"] else "❌") + " Избегать узких улиц",
+            ("✅" if prefs["prefer_right_turns"] else "❌") + " Приоритет правых поворотов",
+        ]
+        await query.message.reply_text(
+            "⚙️ <b>Активные настройки:</b>\n" + "\n".join(prefs_lines),
+            parse_mode="HTML",
+        )
+        return await finish_route(update, context)
+
     elif query.data == "restart_yes":
         context.user_data["deliveries"] = []
+        context.user_data["delivery_addresses"] = []
+        context.user_data.pop("processed_msgs", None)
         await _ask_for_delivery(update, context, first=True)
         return WAITING_FOR_DELIVERY
 
