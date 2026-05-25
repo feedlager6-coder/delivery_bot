@@ -124,6 +124,9 @@ def route_done_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📊 Статистика", callback_data="stats"),
                 InlineKeyboardButton("📖 Помощь", callback_data="help"),
             ],
+            [
+                InlineKeyboardButton("⚙️ Настройки маршрута", callback_data="open_route_prefs"),
+            ],
         ]
     )
 
@@ -707,6 +710,18 @@ async def handle_couriers_input(
         return WAITING_FOR_COURIERS
 
     context.user_data["num_couriers"] = n
+
+    prefs = get_user_preferences(update.effective_user.id)
+    prefs_lines = [
+        ("✅" if prefs["avoid_bad_roads"] else "❌") + " Избегать грунтовок",
+        ("✅" if prefs["avoid_narrow_roads"] else "❌") + " Избегать узких улиц",
+        ("✅" if prefs["prefer_right_turns"] else "❌") + " Приоритет правых поворотов",
+    ]
+    await update.message.reply_text(
+        "⚙️ <b>Активные настройки:</b>\n" + "\n".join(prefs_lines),
+        parse_mode="HTML",
+    )
+
     return await finish_route(update, context)
 
 
@@ -908,6 +923,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "/help — эта справка\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
         )
+        return ConversationHandler.END
+
+    elif query.data == "open_route_prefs":
+        await cmd_route_prefs(update, context)
         return ConversationHandler.END
 
     return ConversationHandler.END
@@ -1196,6 +1215,21 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("route_prefs", cmd_route_prefs))
     app.add_error_handler(error_handler)
+
+    # Force-close any stale Telegram long-poll session from a previous instance.
+    # Without this, the new process gets 409 Conflict until the old session times out.
+    try:
+        _url = f"https://api.telegram.org/bot{token}/getUpdates"
+        _data = json.dumps({"offset": -1, "timeout": 0}).encode("utf-8")
+        _req = urllib.request.Request(
+            _url, data=_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(_req, timeout=5) as _r:
+            logger.info("Pre-start session evict: ok=%s", json.loads(_r.read()).get("ok"))
+    except Exception as _e:
+        logger.warning("Pre-start session evict failed (non-fatal): %s", _e)
 
     logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
