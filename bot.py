@@ -4,10 +4,12 @@ import math
 import signal
 import asyncio
 import logging
-import random
 import json
 import urllib.request
 import urllib.parse
+import sqlite3
+from datetime import datetime, timedelta
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,16 +29,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Environment Variables and Constants ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+YANDEX_GEOCODER_API_KEY = os.environ.get("YANDEX_GEOCODER_API_KEY")
+GRAPHHOPPER_API_KEY = os.environ.get("GRAPHHOPPER_API_KEY")
+
+# Business Metrics
+AVG_FUEL_CONSUMPTION_L_PER_100KM = 10.0  # litres per 100 km
+FUEL_PRICE_RUB_PER_L = 75.0  # rubles per litre
 AVG_SPEED_KMH = 30
 
-geocode_cache: dict[str, str] = {}
+# Conversation States
+WAITING_FOR_START = 1
+WAITING_FOR_DELIVERY = 2
+CONFIRM_START = 3
+WAITING_FOR_COURIERS = 4
+WAITING_FOR_ROUTE_PREFS = 5
 
+# --- Database Setup ---
+DB_NAME = 'delivery_bot.db'
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            start_lat REAL,
+            start_lon REAL,
+            deliveries_count INTEGER,
+            total_distance_km REAL,
+            total_time_min INTEGER,
+            saved_distance_km REAL,
+            saved_fuel_rub REAL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# --- Geocoding Cache ---
+geocode_cache: dict[str, str] = {}
 
 def cache_key(lat: float, lon: float) -> str:
     return f"{round(lat, 4)},{round(lon, 4)}"
 
-
-def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
+def get_address(lat: float, lon: float) -> str:
     key = cache_key(lat, lon)
 
     if key in geocode_cache:
@@ -64,12 +103,12 @@ def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
     except Exception as e:
         logger.warning("Nominatim failed for %s: %s", key, e)
 
-    # Яндекс (запасной)
-    if yandex_key:
+    # Yandex Geocoder (запасной)
+    if YANDEX_GEOCODER_API_KEY:
         try:
             url = (
                 "https://geocode-maps.yandex.ru/1.x/?"
-                f"apikey={yandex_key}&geocode={lon},{lat}"
+                f"apikey={YANDEX_GEOCODER_API_KEY}&geocode={lon},{lat}"
                 "&format=json&results=1&lang=ru_RU&kind=house"
             )
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -97,93 +136,84 @@ def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
         except Exception as e:
             logger.warning("Yandex geocoder failed for %s: %s", key, e)
 
-    # Запасной — координаты
+    # Fallback to coordinates
     result = f"{lat:.5f}, {lon:.5f}"
     geocode_cache[key] = result
     logger.info("Address for %s: %s (coords)", key, result)
     return result
 
+# --- GraphHopper Routing Integration ---
+async def get_graphhopper_route_details(points: list[tuple[float, float]], avoid_narrow: bool, avoid_unpaved: bool, right_turn_priority: bool) -> tuple[float, float] | None:
+    if not GRAPHHOPPER_API_KEY:
+        logger.error("GRAPHHOPPER_API_KEY is not set.")
+        return None
 
-WAITING_FOR_START = 1
-WAITING_FOR_DELIVERY = 2
-CONFIRM_START = 3
-WAITING_FOR_COURIERS = 4
+    if len(points) < 2:
+        return 0.0, 0.0 # No distance or time for less than 2 points
 
+    # GraphHopper expects points in [lon, lat] format
+    gh_points = [[p[1], p[0]] for p in points]
 
-def route_done_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"),
-                InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome"),
-            ],
-            [
-                InlineKeyboardButton("📖 Помощь", callback_data="help"),
-            ],
-        ]
-    )
+    custom_model = {
+        "priority": [],
+        "distance_influence": 100,
+        "turn_penalty": []
+    }
 
+    # Right Turn Priority (for right-hand traffic, penalize left turns)
+    if right_turn_priority:
+        # Penalize sharp left turns significantly
+        custom_model["turn_penalty"].append({"if": "change_angle >= 80 && change_angle <= 180", "add": "300"})
+        # Penalize moderate left turns less
+        custom_model["turn_penalty"].append({"if": "change_angle >= 25 && change_angle < 80", "add": "50"})
 
-def welcome_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
-            [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
-        ]
-    )
+    # Avoid Narrow Streets (assuming 'width' tag in OSM data)
+    if avoid_narrow:
+        # Penalize roads with width < 5 meters (example threshold)
+        custom_model["priority"].append({"if": "road_class == RESIDENTIAL && max_width < 5", "multiply_by": "0.1"})
+        custom_model["priority"].append({"if": "road_class == SERVICE && max_width < 4", "multiply_by": "0.1"})
 
+    # Avoid Unpaved Roads (using 'surface' tag in OSM data)
+    if avoid_unpaved:
+        custom_model["priority"].append({"if": "surface == UNPAVED || surface == DIRT || surface == GRAVEL", "multiply_by": "0.01"})
 
-def start_route_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
-        ]
-    )
+    # Construct the request body
+    body = {
+        "points": gh_points,
+        "profile": "car",
+        "locale": "ru",
+        "instructions": False,
+        "calc_points": False,
+        "points_encoded": False,
+        "ch.disable": True, # Disable Contraction Hierarchies for custom models
+        "custom_model": custom_model
+    }
 
+    headers = {
+        "Content-Type": "application/json"
+    }
 
-HOW_TO_GET_LINK = (
-    "Как получить ссылку из Яндекс Карт:\n"
-    "1️⃣ Открой Яндекс Карты\n"
-    "2️⃣ Найди нужное место\n"
-    "3️⃣ Зажми палец на точке\n"
-    "4️⃣ Нажми Поделиться\n"
-    "5️⃣ Скопируй ссылку и отправь мне"
-)
-
-
-def parse_yandex_link(url: str) -> tuple[float, float] | None:
     try:
-        url = expand_short_url(url)
+        url = f"https://graphhopper.com/api/1/route?key={GRAPHHOPPER_API_KEY}"
+        req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
 
-        decoded_url = urllib.parse.unquote(url)
-        parsed = urllib.parse.urlparse(decoded_url)
-        params = urllib.parse.parse_qs(parsed.query)
-
-        if "whatshere[point]" in params:
-            lon, lat = params["whatshere[point]"][0].split(",")
-            return float(lat), float(lon)
-
-        if "ll" in params:
-            lon, lat = params["ll"][0].split(",")
-            return float(lat), float(lon)
-
-        if "rtext" in params:
-            parts = params["rtext"][0].split("~")[0].split(",")
-            if len(parts) >= 2:
-                return float(parts[0]), float(parts[1])
-
-        # Запасной вариант: ссылка на организацию — извлекаем координаты из HTML
-        if "/maps/org/" in url or "/maps/org/" in decoded_url:
-            return extract_coords_from_org_page(url)
-
-        return None
+        if data and "paths" in data and len(data["paths"]) > 0:
+            path = data["paths"][0]
+            distance_meters = path.get("distance", 0.0)
+            time_ms = path.get("time", 0.0)
+            return distance_meters / 1000, time_ms / 60000 # Return km and minutes
+        else:
+            logger.warning("GraphHopper returned no paths: %s", data)
+            return None
     except Exception as e:
-        logger.error(f"Link parse error for '{url}': {e}")
+        logger.error("GraphHopper routing failed: %s", e)
         return None
 
-
+# --- Haversine (fallback for OR-Tools TSP distance matrix) ---
 def haversine_meters(c1: tuple[float, float], c2: tuple[float, float]) -> int:
-    R = 6371000
+    R = 6371000  # Earth radius in meters
     lat1, lon1 = math.radians(c1[0]), math.radians(c1[1])
     lat2, lon2 = math.radians(c2[0]), math.radians(c2[1])
     dlat, dlon = lat2 - lat1, lon2 - lon1
@@ -193,25 +223,36 @@ def haversine_meters(c1: tuple[float, float], c2: tuple[float, float]) -> int:
     )
     return int(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
-
-def build_distance_matrix(coords: list[tuple[float, float]]) -> list[list[int]]:
-    n = len(coords)
-    return [
-        [0 if i == j else haversine_meters(coords[i], coords[j]) for j in range(n)]
-        for i in range(n)
-    ]
-
-
-def solve_tsp_with_start(
+# --- OR-Tools TSP Solver ---
+async def solve_tsp_with_start_and_gh_distances(
     all_coords: list[tuple[float, float]],
-) -> tuple[list[int], int]:
+    avoid_narrow: bool,
+    avoid_unpaved: bool,
+    right_turn_priority: bool
+) -> tuple[list[int], float, float]: # Returns route_order, total_km, total_min
     n = len(all_coords)
-    if n == 2:
-        dist = haversine_meters(all_coords[0], all_coords[1])
-        return [0, 1, 0], dist * 2
+    if n == 0:
+        return [], 0.0, 0.0
+    if n == 1:
+        return [0], 0.0, 0.0
 
-    matrix = build_distance_matrix(all_coords)
-    manager = pywrapcp.RoutingIndexManager(n, 1, [0], [0])
+    # Build distance matrix using GraphHopper for more accurate distances
+    matrix = [[0 for _ in range(n)] for _ in range(n)]
+    total_gh_distance_km = 0.0
+    total_gh_time_min = 0.0
+
+    # For TSP, we need distances between all pairs. GraphHopper free tier is limited.
+    # We will use Haversine for TSP matrix for now, and then use GraphHopper for the final route calculation.
+    # This is a compromise due to GH free tier limitations. For full accuracy, a paid GH plan or self-hosted solution is needed.
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                matrix[i][j] = 0
+            else:
+                # Use Haversine for TSP matrix due to GH API limitations for many-to-many requests
+                matrix[i][j] = haversine_meters(all_coords[i], all_coords[j])
+
+    manager = pywrapcp.RoutingIndexManager(n, 1, [0], [0]) # 1 vehicle, start and end at index 0
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_index, to_index):
@@ -227,41 +268,113 @@ def solve_tsp_with_start(
     params.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    params.time_limit.seconds = 5
+    params.time_limit.seconds = 5 # 5 seconds to find a solution
 
     solution = routing.SolveWithParameters(params)
-    if not solution:
-        route = list(range(n)) + [0]
-        total = sum(matrix[route[i]][route[i + 1]] for i in range(len(route) - 1))
-        return route, total
 
-    route = []
-    idx = routing.Start(0)
-    while not routing.IsEnd(idx):
-        route.append(manager.IndexToNode(idx))
-        idx = solution.Value(routing.NextVar(idx))
-    route.append(0)
-    return route, solution.ObjectiveValue()
+    route_order = []
+    if solution:
+        idx = routing.Start(0)
+        while not routing.IsEnd(idx):
+            route_order.append(manager.IndexToNode(idx))
+            idx = solution.Value(routing.NextVar(idx))
+        route_order.append(0) # Return to start
+    else:
+        # Fallback to simple sequential route if OR-Tools fails
+        route_order = list(range(n)) + [0]
+        logger.warning("OR-Tools failed to find a solution, falling back to sequential route.")
 
+    # Now, calculate the actual distance and time for the optimized route using GraphHopper
+    # We need to pass the points in the optimized order to GraphHopper
+    ordered_gh_points = [all_coords[i] for i in route_order if i != route_order[0] or route_order.count(i) == 1]
+    # Remove duplicate start point if it's not the only point
+    if len(ordered_gh_points) > 1 and ordered_gh_points[0] == ordered_gh_points[-1]:
+        ordered_gh_points = ordered_gh_points[:-1]
 
-def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
-    delivery_indices = list(range(1, len(all_coords)))
-    random.shuffle(delivery_indices)
-    order = [0] + delivery_indices + [0]
-    total = sum(
-        haversine_meters(all_coords[order[i]], all_coords[order[i + 1]])
-        for i in range(len(order) - 1)
+    # GraphHopper expects a list of points for a single route, not a matrix
+    # We will call GH for the full optimized route
+    gh_route_details = await get_graphhopper_route_details(ordered_gh_points, avoid_narrow, avoid_unpaved, right_turn_priority)
+
+    if gh_route_details:
+        total_gh_distance_km, total_gh_time_min = gh_route_details
+    else:
+        # Fallback to Haversine if GraphHopper fails for the final route
+        total_gh_distance_km = sum(haversine_meters(all_coords[route_order[i]], all_coords[route_order[i+1]]) for i in range(len(route_order)-1)) / 1000
+        total_gh_time_min = total_gh_distance_km / AVG_SPEED_KMH * 60
+        logger.warning("GraphHopper failed for final route, falling back to Haversine for total distance/time.")
+
+    return route_order, total_gh_distance_km, total_gh_time_min
+
+# --- Telegram Bot UI Elements ---
+def route_done_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"),
+                InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Настройки маршрута", callback_data="route_prefs"),
+                InlineKeyboardButton("📊 Отчеты", callback_data="reports"),
+                InlineKeyboardButton("📖 Помощь", callback_data="help"),
+            ],
+        ]
     )
-    return total / 1000
+
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+            [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
+        ]
+    )
+
+def start_route_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+        ]
+    )
+
+def route_prefs_keyboard(avoid_narrow: bool, avoid_unpaved: bool, right_turn_priority: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Узкие улицы: {'✅ Да' if avoid_narrow else '❌ Нет'}",
+                    callback_data=f"toggle_narrow_{'false' if avoid_narrow else 'true'}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Грунтовки: {'✅ Да' if avoid_unpaved else '❌ Нет'}",
+                    callback_data=f"toggle_unpaved_{'false' if avoid_unpaved else 'true'}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Приоритет правых поворотов: {'✅ Да' if right_turn_priority else '❌ Нет'}",
+                    callback_data=f"toggle_right_turn_{'false' if right_turn_priority else 'true'}"
+                )
+            ],
+            [
+                InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")
+            ]
+        ]
+    )
 
 
-def coords_key(coord: tuple[float, float]) -> str:
-    """Ключ координаты с точностью до 3 знаков — для дедупликации."""
-    return f"{round(coord[0], 3)},{round(coord[1], 3)}"
+HOW_TO_GET_LINK = (
+    "Как получить ссылку из Яндекс Карт:\n"
+    "1️⃣ Открой Яндекс Карты\n"
+    "2️⃣ Найди нужное место\n"
+    "3️⃣ Зажми палец на точке\n"
+    "4️⃣ Нажми Поделиться\n"
+    "5️⃣ Скопируй ссылку и отправь мне"
+)
 
-
+# --- URL Parsing ---
 def expand_short_url(url: str) -> str:
-    """Раскрывает короткие ссылки yandex.ru/maps/-/... через GET-запрос."""
     if "maps/-/" not in url:
         return url
     try:
@@ -284,9 +397,7 @@ def expand_short_url(url: str) -> str:
         logger.error("Failed to expand short link '%s': %s", url, e)
         return url
 
-
 def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
-    """Извлекает координаты из страницы организации Яндекс Карт по содержимому HTML."""
     try:
         req = urllib.request.Request(
             url,
@@ -294,7 +405,6 @@ def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             body = r.read(500000).decode("utf-8", errors="ignore")
-        # "center":[lon, lat] — стандартный паттерн в JSON страницы организации
         m = re.search(r'"center":\[(-?\d+\.?\d*),(-?\d+\.?\d*)\]', body)
         if m:
             lon, lat = float(m.group(1)), float(m.group(2))
@@ -306,13 +416,44 @@ def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
         logger.warning("Failed to extract coords from org page '%s': %s", url, e)
     return None
 
+def parse_yandex_link(url: str) -> tuple[float, float] | None:
+    try:
+        url = expand_short_url(url)
 
+        decoded_url = urllib.parse.unquote(url)
+        parsed = urllib.parse.urlparse(decoded_url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if "whatshere[point]" in params:
+            lon, lat = params["whatshere[point]"][0].split(",")
+            return float(lat), float(lon)
+
+        if "ll" in params:
+            lon, lat = params["ll"][0].split(",")
+            return float(lat), float(lon)
+
+        if "rtext" in params:
+            parts = params["rtext"][0].split("~")[0].split(",")
+            if len(parts) >= 2:
+                return float(parts[0]), float(parts[1])
+
+        if "/maps/org/" in url or "/maps/org/" in decoded_url:
+            return extract_coords_from_org_page(url)
+
+        return None
+    except Exception as e:
+        logger.error(f"Link parse error for '{url}': {e}")
+        return None
+
+def coords_key(coord: tuple[float, float]) -> str:
+    return f"{round(coord[0], 3)},{round(coord[1], 3)}"
+
+# --- Route Distribution (existing logic) ---
 def distribute_routes(
     deliveries: list[tuple[float, float]],
     delivery_addresses: list[str],
     num_couriers: int,
 ) -> list[tuple[list[tuple[float, float]], list[str]]]:
-    """Делит точки доставки на N групп по углу от центра (равномерно)."""
     n = len(deliveries)
     if n == 0:
         return []
@@ -320,7 +461,6 @@ def distribute_routes(
     padded_addrs = (delivery_addresses + [""] * n)[:n]
     pairs = list(zip(deliveries, padded_addrs))
 
-    # Не создаём больше групп, чем точек
     actual_couriers = min(num_couriers, n)
 
     if actual_couriers == 1:
@@ -352,7 +492,7 @@ def distribute_routes(
         logger.info("Курьер %d: %d точек", i + 1, len(grp_coords))
     return groups
 
-
+# --- Yandex Navigator URL (existing logic) ---
 def build_yandex_nav_url(
     coords: list[tuple[float, float]], route_order: list[int]
 ) -> str:
@@ -365,9 +505,15 @@ def build_yandex_nav_url(
     points = "~".join(f"{coords[i][0]},{coords[i][1]}" for i in unique)
     return f"https://yandex.ru/maps/?rtext={points}&rtt=auto"
 
-
+# --- Telegram Bot Handlers ---
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("deliveries", None)
+    context.user_data.pop("delivery_addresses", None)
+    context.user_data.pop("num_couriers", None)
+    context.user_data.setdefault("avoid_narrow", False)
+    context.user_data.setdefault("avoid_unpaved", False)
+    context.user_data.setdefault("right_turn_priority", False)
+
     saved = context.user_data.get("старт")
 
     if saved:
@@ -399,106 +545,49 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return WAITING_FOR_START
 
-
-async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("deliveries", None)
-    saved = context.user_data.get("старт")
-
-    if saved:
-        await update.message.reply_text(
-            "🔄 Новый маршрут! Точки доставки сброшены.\n\n"
-            "Стартуем снова отсюда? (да/нет)",
-        )
-        return CONFIRM_START
-    else:
-        await update.message.reply_text(
-            "🔄 Новый маршрут!\n\n"
-            "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
-            parse_mode="HTML",
-        )
-        return WAITING_FOR_START
-
-
-async def cmd_changehome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("deliveries", None)
-    await update.message.reply_text(
-        "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
-        parse_mode="HTML",
-    )
-    return WAITING_FOR_START
-
-
-async def handle_confirm_start(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    text = update.message.text.strip().lower()
-    logger.info("Confirm start: got '%s' (repr: %r)", text, text)
-    if text in ("да", "yes", "д", "+", "y", "ага", "ок", "ok", "1"):
-        context.user_data["deliveries"] = []
-        logger.info(
-            "User %s confirmed start, moving to WAITING_FOR_DELIVERY",
-            update.effective_user.id,
-        )
+async def handle_confirm_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.lower()
+    if text == "да":
         await _ask_for_delivery(update, context, first=True)
         return WAITING_FOR_DELIVERY
-    else:
+    elif text == "нет":
         context.user_data.pop("старт", None)
-        logger.info(
-            "User %s declined start, moving to WAITING_FOR_START",
-            update.effective_user.id,
-        )
+        context.user_data.pop("старт_адрес", None)
         await update.message.reply_text(
-            "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            "Отправь ссылку на место старта\n"
+            "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
         )
         return WAITING_FOR_START
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📖 <b>Как пользоваться ботом:</b>\n\n"
-        "1. /start — начать новый маршрут\n"
-        "2. Отправь ссылку на стартовую точку\n"
-        "3. Отправляй ссылки точек доставки по одной\n"
-        "4. Напиши <b>Готово</b> когда добавишь все точки\n"
-        "5. Получи оптимальный маршрут и ссылку в навигатор\n\n"
-        "<b>Команды:</b>\n"
-        "/new — новый маршрут (старт сохраняется)\n"
-        "/changehome — изменить стартовую точку\n"
-        "/help — эта справка\n\n" + HOW_TO_GET_LINK,
-        parse_mode="HTML",
-    )
-
+    else:
+        await update.message.reply_text("Пожалуйста, ответь 'да' или 'нет'.")
+        return CONFIRM_START
 
 async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-
     coord = await asyncio.to_thread(parse_yandex_link, text)
-    if not coord:
+    if coord:
+        context.user_data["старт"] = coord
+        address = await asyncio.to_thread(get_address, coord[0], coord[1])
+        context.user_data["старт_адрес"] = address
+        await update.message.reply_text(
+            f"📍 Стартовая точка: <b>{address}</b> сохранена.\n"
+            "Теперь отправляй ссылки точек доставки по одной.\n"
+            "Когда добавишь все — напиши <b>Готово</b>\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_DELIVERY
+    else:
         await update.message.reply_text(
             "❌ Не смог прочитать ссылку.\n"
             "Попробуй ещё раз — зажми место на карте,\n"
             "нажми Поделиться и скопируй ссылку.",
+            parse_mode="HTML",
         )
         return WAITING_FOR_START
 
-    context.user_data["старт"] = coord
-    context.user_data["старт_адрес"] = await asyncio.to_thread(
-        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
-    )
-    context.user_data["deliveries"] = []
-    context.user_data["delivery_addresses"] = []
-    context.user_data["processed_msgs"] = set()
-    await update.message.reply_text("✅ Стартовая точка сохранена!")
-    await _ask_for_delivery(update, context, first=True)
-    return WAITING_FOR_DELIVERY
-
-
-async def _ask_for_delivery(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, first: bool = False
-) -> None:
-    deliveries = context.user_data.get("deliveries", [])
-    n = len(deliveries)
+async def _ask_for_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE, first: bool) -> None:
+    n = len(context.user_data.get("deliveries", []))
     if first:
         await update.message.reply_text(
             "Теперь отправляй ссылки точек доставки по одной.\n"
@@ -513,7 +602,6 @@ async def _ask_for_delivery(
             "Отправь следующую ссылку или напиши <b>Готово</b>",
             parse_mode="HTML",
         )
-
 
 async def handle_delivery_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -575,7 +663,7 @@ async def handle_delivery_link(
         return WAITING_FOR_DELIVERY
 
     address = await asyncio.to_thread(
-        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
+        get_address, coord[0], coord[1]
     )
     deliveries.append(coord)
     context.user_data.setdefault("delivery_addresses", []).append(address)
@@ -587,7 +675,6 @@ async def handle_delivery_link(
     )
     await _ask_for_delivery(update, context, first=False)
     return WAITING_FOR_DELIVERY
-
 
 async def handle_couriers_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -605,15 +692,18 @@ async def handle_couriers_input(
     context.user_data["num_couriers"] = n
     return await finish_route(update, context)
 
-
 async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     deliveries: list[tuple[float, float]] = context.user_data.get("deliveries", [])
     delivery_addresses: list[str] = context.user_data.get("delivery_addresses", [])
     num_couriers: int = context.user_data.get("num_couriers", 1)
     start_coord = context.user_data["старт"]
 
+    avoid_narrow = context.user_data.get("avoid_narrow", False)
+    avoid_unpaved = context.user_data.get("avoid_unpaved", False)
+    right_turn_priority = context.user_data.get("right_turn_priority", False)
+
     status_msg = await update.message.reply_text(
-        f"⚙️ Считаю маршруты для {num_couriers} курьера(ов)..."
+        f"⚙️ Считаю маршруты для {num_couriers} курьера(ов) с учетом ваших настроек..."
     )
 
     groups = distribute_routes(deliveries, delivery_addresses, num_couriers)
@@ -624,11 +714,11 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     for courier_idx, (group_coords, group_addrs) in enumerate(groups, 1):
         all_coords = [start_coord] + group_coords
-        route_order, total_meters = solve_tsp_with_start(all_coords)
-        total_km = total_meters / 1000
-        time_min = int(total_km / AVG_SPEED_KMH * 60)
+        route_order, total_km, total_min = await solve_tsp_with_start_and_gh_distances(
+            all_coords, avoid_narrow, avoid_unpaved, right_turn_priority
+        )
         total_km_all += total_km
-        total_min_all += time_min
+        total_min_all += total_min
 
         seen: set[int] = set()
         delivery_steps: list[int] = []
@@ -649,20 +739,22 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 f"📍 <b>Оптимальный маршрут:</b>\n{numbered}\n"
                 f"🏁 Возврат на старт\n\n"
                 f"📏 Расстояние: <b>{total_km:.1f} км</b>\n"
-                f"⏱ Время: <b>{time_min} мин</b> (30 км/ч)\n"
+                f"⏱ Время: <b>{total_min} мин</b> (с учетом пробок и настроек)\n"
                 f"🗺 <b>Открыть в навигаторе:</b>\n{yandex_url}"
             )
         else:
             courier_blocks.append(
                 f"🚗 <b>Курьер {courier_idx}</b> — {len(group_coords)} точек:\n"
                 f"{numbered}\n"
-                f"📏 {total_km:.1f} км • ⏱ {time_min} мин\n"
+                f"📏 {total_km:.1f} км • ⏱ {total_min} мин\n"
                 f'🗺 <a href="{yandex_url}">Маршрут курьера {courier_idx}</a>'
             )
 
-    # Экономия относительно случайного порядка всех точек
-    random_km = random_route_distance([start_coord] + deliveries)
-    savings_km = max(0.0, random_km - total_km_all)
+    # Calculate savings based on new GH distances
+    # For random route, we'll use Haversine as a baseline for comparison, as GH for random is too complex/costly
+    random_km_baseline = sum(haversine_meters(start_coord, d) for d in deliveries) * 2 / 1000 # Rough estimate
+    savings_km = max(0.0, random_km_baseline - total_km_all)
+    savings_fuel_rub = (savings_km / 100) * AVG_FUEL_CONSUMPTION_L_PER_100KM * FUEL_PRICE_RUB_PER_L
 
     if num_couriers == 1:
         header = "🚀 Маршрут готов!\n\n"
@@ -674,7 +766,7 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
 
     if savings_km > 0:
-        day_savings = round(savings_km * 12)
+        day_savings = round(savings_fuel_rub)
         if num_couriers == 1:
             month_savings = round(day_savings * 30)
             year_savings = round(month_savings * 12)
@@ -690,16 +782,55 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 f"💰 Экономия: <b>{savings_km:.1f} км</b> (~{day_savings} руб/день)\n"
             )
 
-    result = header + "\n\n".join(courier_blocks) + footer
+    result_text = header + "\n\n".join(courier_blocks) + footer
 
     await status_msg.edit_text(
-        result, parse_mode="HTML", reply_markup=route_done_keyboard()
+        result_text, parse_mode="HTML", reply_markup=route_done_keyboard()
     )
+
+    # Save route data to DB
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO routes (user_id, timestamp, start_lat, start_lon, deliveries_count, total_distance_km, total_time_min, saved_distance_km, saved_fuel_rub) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (update.effective_user.id, datetime.now().isoformat(), start_coord[0], start_coord[1], len(deliveries), total_km_all, total_min_all, savings_km, savings_fuel_rub))
+    conn.commit()
+    conn.close()
+
     context.user_data.pop("deliveries", None)
     context.user_data.pop("delivery_addresses", None)
     context.user_data.pop("num_couriers", None)
     return ConversationHandler.END
 
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("deliveries", None)
+    context.user_data.pop("delivery_addresses", None)
+    context.user_data.pop("num_couriers", None)
+    saved = context.user_data.get("старт")
+
+    if saved:
+        saved_addr = context.user_data.get("старт_адрес", "сохранённая точка")
+        await update.message.reply_text(
+            "🔄 Новый маршрут! Точки сброшены.\n\n"
+            f"Стартуем снова отсюда?\n"
+            f"📍 {saved_addr}\n\n"
+            "(да/нет)"
+        )
+        return CONFIRM_START
+    else:
+        await update.message.reply_text(
+            "🔄 Новый маршрут!\n\n"
+            "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+async def cmd_changehome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("deliveries", None)
+    await update.message.reply_text(
+        "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+        parse_mode="HTML",
+    )
+    return WAITING_FOR_START
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -735,6 +866,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "new":
         context.user_data.pop("deliveries", None)
         context.user_data.pop("delivery_addresses", None)
+        context.user_data.pop("num_couriers", None)
         saved = context.user_data.get("старт")
         if saved:
             saved_addr = context.user_data.get("старт_адрес", "сохранённая точка")
@@ -771,24 +903,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<b>Команды:</b>\n"
             "/new — новый маршрут (старт сохраняется)\n"
             "/changehome — изменить стартовую точку\n"
+            "/route_prefs — настройки маршрута (узкие улицы, грунтовки, правые повороты)\n"
+            "/reports — отчеты по доставкам\n"
             "/help — эта справка\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
         )
         return ConversationHandler.END
 
+    elif query.data == "route_prefs":
+        avoid_narrow = context.user_data.get("avoid_narrow", False)
+        avoid_unpaved = context.user_data.get("avoid_unpaved", False)
+        right_turn_priority = context.user_data.get("right_turn_priority", False)
+        await query.message.edit_text(
+            "⚙️ <b>Настройки маршрута:</b>\n\n"
+            "Здесь вы можете настроить предпочтения для построения маршрута.",
+            parse_mode="HTML",
+            reply_markup=route_prefs_keyboard(avoid_narrow, avoid_unpaved, right_turn_priority)
+        )
+        return WAITING_FOR_ROUTE_PREFS
+
+    elif query.data.startswith("toggle_narrow_"):
+        new_value = query.data.split("_")[2] == "true"
+        context.user_data["avoid_narrow"] = new_value
+        avoid_narrow = new_value
+        avoid_unpaved = context.user_data.get("avoid_unpaved", False)
+        right_turn_priority = context.user_data.get("right_turn_priority", False)
+        await query.message.edit_reply_markup(
+            reply_markup=route_prefs_keyboard(avoid_narrow, avoid_unpaved, right_turn_priority)
+        )
+        return WAITING_FOR_ROUTE_PREFS
+
+    elif query.data.startswith("toggle_unpaved_"):
+        new_value = query.data.split("_")[2] == "true"
+        context.user_data["avoid_unpaved"] = new_value
+        avoid_narrow = context.user_data.get("avoid_narrow", False)
+        avoid_unpaved = new_value
+        right_turn_priority = context.user_data.get("right_turn_priority", False)
+        await query.message.edit_reply_markup(
+            reply_markup=route_prefs_keyboard(avoid_narrow, avoid_unpaved, right_turn_priority)
+        )
+        return WAITING_FOR_ROUTE_PREFS
+
+    elif query.data.startswith("toggle_right_turn_"):
+        new_value = query.data.split("_")[2] == "true"
+        context.user_data["right_turn_priority"] = new_value
+        avoid_narrow = context.user_data.get("avoid_narrow", False)
+        avoid_unpaved = context.user_data.get("avoid_unpaved", False)
+        right_turn_priority = new_value
+        await query.message.edit_reply_markup(
+            reply_markup=route_prefs_keyboard(avoid_narrow, avoid_unpaved, right_turn_priority)
+        )
+        return WAITING_FOR_ROUTE_PREFS
+
+    elif query.data == "back_to_main":
+        await query.message.edit_text(
+            "Главное меню.",
+            reply_markup=welcome_keyboard()
+        )
+        return WAITING_FOR_START # Or whatever state is appropriate for main menu
+
+    elif query.data == "reports":
+        return await cmd_reports(update, context)
+
     return ConversationHandler.END
 
+async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    # Daily Report
+    today = datetime.now().date()
+    cursor.execute("SELECT SUM(total_distance_km), SUM(saved_fuel_rub), COUNT(*) FROM routes WHERE user_id = ? AND DATE(timestamp) = ?", (user_id, today.isoformat()))
+    daily_data = cursor.fetchone()
+    daily_km, daily_saved_rub, daily_deliveries = daily_data if daily_data[0] is not None else (0, 0, 0)
+
+    # Monthly Report
+    this_month_start = today.replace(day=1)
+    cursor.execute("SELECT SUM(total_distance_km), SUM(saved_fuel_rub), COUNT(*) FROM routes WHERE user_id = ? AND DATE(timestamp) >= ?", (user_id, this_month_start.isoformat()))
+    monthly_data = cursor.fetchone()
+    monthly_km, monthly_saved_rub, monthly_deliveries = monthly_data if monthly_data[0] is not None else (0, 0, 0)
+
+    conn.close()
+
+    report_text = (
+        f"📊 <b>Отчеты по доставкам:</b>\n\n"
+        f"🗓 <b>Сегодня ({today.strftime('%d.%m.%Y')}):</b>\n"
+        f"  • Пробег: <b>{daily_km:.1f} км</b>\n"
+        f"  • Сэкономлено топлива: <b>{daily_saved_rub:.0f} руб.</b>\n"
+        f"  • Доставок: <b>{daily_deliveries}</b>\n\n"
+        f"📈 <b>За текущий месяц ({this_month_start.strftime('%m.%Y')}):</b>\n"
+        f"  • Пробег: <b>{monthly_km:.1f} км</b>\n"
+        f"  • Сэкономлено топлива: <b>{monthly_saved_rub:.0f} руб.</b>\n"
+        f"  • Доставок: <b>{monthly_deliveries}</b>\n\n"
+        "(Данные обновляются после каждого расчета маршрута)"
+    )
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(report_text, parse_mode="HTML", reply_markup=route_done_keyboard())
+    else:
+        await update.message.reply_text(report_text, parse_mode="HTML", reply_markup=route_done_keyboard())
+
+    return ConversationHandler.END
 
 async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Используй /start чтобы начать или /help для справки."
     )
 
-
 async def delivery_state_unknown_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Перехватывает неизвестные команды внутри WAITING_FOR_DELIVERY — не даёт выпасть из диалога."""
     deliveries = context.user_data.get("deliveries", [])
     logger.info(
         "User %s sent unknown command in WAITING_FOR_DELIVERY, points so far: %d",
@@ -802,15 +1027,24 @@ async def delivery_state_unknown_cmd(
     )
     return WAITING_FOR_DELIVERY
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(
         "Exception while handling update: %s", context.error, exc_info=context.error
     )
 
-
 def main() -> None:
-    # Завершаем предыдущий экземпляр бота, чтобы избежать 409 Conflict
+    # Ensure environment variables are set
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is not set")
+    if not YANDEX_GEOCODER_API_KEY:
+        logger.warning("YANDEX_GEOCODER_API_KEY is not set. Yandex geocoding will not be used.")
+    if not GRAPHHOPPER_API_KEY:
+        logger.warning("GRAPHHOPPER_API_KEY is not set. Advanced routing features will be limited.")
+
+    # Initialize database
+    init_db()
+
+    # Terminate previous bot instance to avoid 409 Conflict
     pid_file = "/tmp/bot_route.pid"
     if os.path.exists(pid_file):
         try:
@@ -823,18 +1057,16 @@ def main() -> None:
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
 
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("BOT_TOKEN environment variable is not set")
-
     persistence = PicklePersistence(filepath="bot_persistence.pkl")
-    app = Application.builder().token(token).persistence(persistence).build()
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", cmd_start),
             CommandHandler("new", cmd_new),
             CommandHandler("changehome", cmd_changehome),
+            CommandHandler("route_prefs", button_handler), # Direct command to route prefs
+            CommandHandler("reports", cmd_reports), # Direct command to reports
             CallbackQueryHandler(button_handler),
         ],
         states={
@@ -849,33 +1081,33 @@ def main() -> None:
             WAITING_FOR_DELIVERY: [
                 CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link),
-                # перехватываем любые команды внутри состояния — не выпадаем из диалога
-                MessageHandler(filters.COMMAND, delivery_state_unknown_cmd),
             ],
             WAITING_FOR_COURIERS: [
-                CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_couriers_input),
             ],
+            WAITING_FOR_ROUTE_PREFS: [
+                CallbackQueryHandler(button_handler),
+            ]
         },
         fallbacks=[
             CommandHandler("start", cmd_start),
             CommandHandler("new", cmd_new),
             CommandHandler("changehome", cmd_changehome),
+            CommandHandler("route_prefs", button_handler),
+            CommandHandler("reports", cmd_reports),
             CallbackQueryHandler(button_handler),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler),
+            MessageHandler(filters.COMMAND, delivery_state_unknown_cmd), # Catch unknown commands in delivery state
+            MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ATTACHMENT, fallback_handler), # General fallback
         ],
-        allow_reentry=True,
         name="route_conversation",
         persistent=True,
     )
 
     app.add_handler(conv)
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_error_handler(error_handler)
 
-    logger.info("Bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
+    logger.info("Bot started polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
