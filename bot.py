@@ -3,13 +3,13 @@ import re
 import math
 import signal
 import asyncio
+import sqlite3
 import logging
+import random
 import json
 import urllib.request
 import urllib.parse
-import sqlite3
-from datetime import datetime
-
+from datetime import date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -24,264 +24,971 @@ from telegram.ext import (
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
-# --- Logging Setup ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Environment & Constants ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-YANDEX_KEY = os.environ.get("YANDEX_GEOCODER_API_KEY") or os.environ.get("YANDEX_KEY")
-GRAPHHOPPER_KEY = os.environ.get("GRAPHHOPPER_API_KEY")
-
-# Economics (Дагестан)
-AVG_FUEL_CONSUMPTION = 10.0
-FUEL_PRICE = 75.0
 AVG_SPEED_KMH = 30
 
-# States
-WAITING_FOR_START, WAITING_FOR_DELIVERY, CONFIRM_START, WAITING_FOR_COURIERS, WAITING_FOR_PREFS = range(1, 6)
+geocode_cache: dict[str, str] = {}
 
-# --- DB Setup ---
-DB_NAME = 'delivery_bot.db'
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute('''CREATE TABLE IF NOT EXISTS routes 
-        (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, timestamp TEXT, 
-        dist REAL, saved_rub REAL, count INTEGER)''')
+def cache_key(lat: float, lon: float) -> str:
+    return f"{round(lat, 4)},{round(lon, 4)}"
+
+
+def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
+    key = cache_key(lat, lon)
+
+    if key in geocode_cache:
+        logger.info("Address for %s: %s (cache)", key, geocode_cache[key])
+        return geocode_cache[key]
+
+    # Nominatim (бесплатно, приоритет)
+    try:
+        url = (
+            "https://nominatim.openstreetmap.org/reverse?"
+            f"lat={lat}&lon={lon}"
+            "&format=json&accept-language=ru"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "delivery-bot-1.0"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        addr = data.get("address", {})
+        road = addr.get("road", "")
+        house = addr.get("house_number", "")
+        if road:
+            result = f"{road}, {house}" if house else road
+            geocode_cache[key] = result
+            logger.info("Address for %s: %s (nominatim)", key, result)
+            return result
+    except Exception as e:
+        logger.warning("Nominatim failed for %s: %s", key, e)
+
+    # Яндекс (запасной)
+    if yandex_key:
+        try:
+            url = (
+                "https://geocode-maps.yandex.ru/1.x/?"
+                f"apikey={yandex_key}&geocode={lon},{lat}"
+                "&format=json&results=1&lang=ru_RU&kind=house"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            members = (
+                data.get("response", {})
+                .get("GeoObjectCollection", {})
+                .get("featureMember", [])
+            )
+            if members:
+                name = (
+                    members[0]
+                    .get("GeoObject", {})
+                    .get("metaDataProperty", {})
+                    .get("GeocoderMetaData", {})
+                    .get("text", "")
+                )
+                if name:
+                    parts = name.split(", ")
+                    result = ", ".join(parts[-2:]) if len(parts) >= 2 else name
+                    geocode_cache[key] = result
+                    logger.info("Address for %s: %s (yandex)", key, result)
+                    return result
+        except Exception as e:
+            logger.warning("Yandex geocoder failed for %s: %s", key, e)
+
+    # Запасной — координаты
+    result = f"{lat:.5f}, {lon:.5f}"
+    geocode_cache[key] = result
+    logger.info("Address for %s: %s (coords)", key, result)
+    return result
+
+
+WAITING_FOR_START = 1
+WAITING_FOR_DELIVERY = 2
+CONFIRM_START = 3
+WAITING_FOR_COURIERS = 4
+
+
+def route_done_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"),
+                InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome"),
+            ],
+            [
+                InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+                InlineKeyboardButton("📖 Помощь", callback_data="help"),
+            ],
+        ]
+    )
+
+
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+            [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
+        ]
+    )
+
+
+def start_route_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+        ]
+    )
+
+
+HOW_TO_GET_LINK = (
+    "Как получить ссылку из Яндекс Карт:\n"
+    "1️⃣ Открой Яндекс Карты\n"
+    "2️⃣ Найди нужное место\n"
+    "3️⃣ Зажми палец на точке\n"
+    "4️⃣ Нажми Поделиться\n"
+    "5️⃣ Скопируй ссылку и отправь мне"
+)
+
+
+def parse_yandex_link(url: str) -> tuple[float, float] | None:
+    try:
+        url = expand_short_url(url)
+
+        decoded_url = urllib.parse.unquote(url)
+        parsed = urllib.parse.urlparse(decoded_url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if "whatshere[point]" in params:
+            lon, lat = params["whatshere[point]"][0].split(",")
+            return float(lat), float(lon)
+
+        if "ll" in params:
+            lon, lat = params["ll"][0].split(",")
+            return float(lat), float(lon)
+
+        if "rtext" in params:
+            parts = params["rtext"][0].split("~")[0].split(",")
+            if len(parts) >= 2:
+                return float(parts[0]), float(parts[1])
+
+        # Запасной вариант: ссылка на организацию — извлекаем координаты из HTML
+        if "/maps/org/" in url or "/maps/org/" in decoded_url:
+            return extract_coords_from_org_page(url)
+
+        return None
+    except Exception as e:
+        logger.error(f"Link parse error for '{url}': {e}")
+        return None
+
+
+def haversine_meters(c1: tuple[float, float], c2: tuple[float, float]) -> int:
+    R = 6371000
+    lat1, lon1 = math.radians(c1[0]), math.radians(c1[1])
+    lat2, lon2 = math.radians(c2[0]), math.radians(c2[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    return int(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+def build_distance_matrix(coords: list[tuple[float, float]]) -> list[list[int]]:
+    n = len(coords)
+    return [
+        [0 if i == j else haversine_meters(coords[i], coords[j]) for j in range(n)]
+        for i in range(n)
+    ]
+
+
+def solve_tsp_with_start(
+    all_coords: list[tuple[float, float]],
+) -> tuple[list[int], int]:
+    n = len(all_coords)
+    if n == 2:
+        dist = haversine_meters(all_coords[0], all_coords[1])
+        return [0, 1, 0], dist * 2
+
+    matrix = build_distance_matrix(all_coords)
+    manager = pywrapcp.RoutingIndexManager(n, 1, [0], [0])
+    routing = pywrapcp.RoutingModel(manager)
+
+    def distance_callback(from_index, to_index):
+        return matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
+    transit_idx = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    params.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    params.time_limit.seconds = 5
+
+    solution = routing.SolveWithParameters(params)
+    if not solution:
+        route = list(range(n)) + [0]
+        total = sum(matrix[route[i]][route[i + 1]] for i in range(len(route) - 1))
+        return route, total
+
+    route = []
+    idx = routing.Start(0)
+    while not routing.IsEnd(idx):
+        route.append(manager.IndexToNode(idx))
+        idx = solution.Value(routing.NextVar(idx))
+    route.append(0)
+    return route, solution.ObjectiveValue()
+
+
+def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
+    delivery_indices = list(range(1, len(all_coords)))
+    random.shuffle(delivery_indices)
+    order = [0] + delivery_indices + [0]
+    total = sum(
+        haversine_meters(all_coords[order[i]], all_coords[order[i + 1]])
+        for i in range(len(order) - 1)
+    )
+    return total / 1000
+
+
+def coords_key(coord: tuple[float, float]) -> str:
+    """Ключ координаты с точностью до 3 знаков — для дедупликации."""
+    return f"{round(coord[0], 3)},{round(coord[1], 3)}"
+
+
+def expand_short_url(url: str) -> str:
+    """Раскрывает короткие ссылки yandex.ru/maps/-/... через GET-запрос."""
+    if "maps/-/" not in url:
+        return url
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15"
+                )
+            },
+            method="GET",
+        )
+        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+        response = opener.open(req, timeout=10)
+        final_url = response.geturl()
+        logger.info("Expanded short link: %s -> %s", url, final_url)
+        return final_url
+    except Exception as e:
+        logger.error("Failed to expand short link '%s': %s", url, e)
+        return url
+
+
+def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
+    """Извлекает координаты из страницы организации Яндекс Карт по содержимому HTML."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read(500000).decode("utf-8", errors="ignore")
+        # "center":[lon, lat] — стандартный паттерн в JSON страницы организации
+        m = re.search(r'"center":\[(-?\d+\.?\d*),(-?\d+\.?\d*)\]', body)
+        if m:
+            lon, lat = float(m.group(1)), float(m.group(2))
+            logger.info(
+                "Extracted org coords from page body: lat=%.6f lon=%.6f", lat, lon
+            )
+            return lat, lon
+    except Exception as e:
+        logger.warning("Failed to extract coords from org page '%s': %s", url, e)
+    return None
+
+
+def distribute_routes(
+    deliveries: list[tuple[float, float]],
+    delivery_addresses: list[str],
+    num_couriers: int,
+) -> list[tuple[list[tuple[float, float]], list[str]]]:
+    """Делит точки доставки на N групп по углу от центра (равномерно)."""
+    n = len(deliveries)
+    if n == 0:
+        return []
+
+    padded_addrs = (delivery_addresses + [""] * n)[:n]
+    pairs = list(zip(deliveries, padded_addrs))
+
+    # Не создаём больше групп, чем точек
+    actual_couriers = min(num_couriers, n)
+
+    if actual_couriers == 1:
+        groups = [(deliveries, list(delivery_addresses))]
+    else:
+        center_lat = sum(p[0][0] for p in pairs) / n
+        center_lon = sum(p[0][1] for p in pairs) / n
+
+        sorted_pairs = sorted(
+            pairs,
+            key=lambda p: math.atan2(p[0][0] - center_lat, p[0][1] - center_lon),
+        )
+
+        base_size = n // actual_couriers
+        remainder = n % actual_couriers
+        groups = []
+        idx = 0
+        for i in range(actual_couriers):
+            size = base_size + (1 if i < remainder else 0)
+            chunk = sorted_pairs[idx : idx + size]
+            idx += size
+            if chunk:
+                groups.append(([c[0] for c in chunk], [c[1] for c in chunk]))
+
+    total_assigned = sum(len(g[0]) for g in groups)
+    if total_assigned != n:
+        logger.error("distribute_routes: потеряны точки: %d != %d", total_assigned, n)
+    for i, (grp_coords, _) in enumerate(groups):
+        logger.info("Курьер %d: %d точек", i + 1, len(grp_coords))
+    return groups
+
+
+def build_yandex_nav_url(
+    coords: list[tuple[float, float]], route_order: list[int]
+) -> str:
+    seen = set()
+    unique = []
+    for i in route_order:
+        if i not in seen:
+            unique.append(i)
+            seen.add(i)
+    points = "~".join(f"{coords[i][0]},{coords[i][1]}" for i in unique)
+    return f"https://yandex.ru/maps/?rtext={points}&rtt=auto"
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("deliveries", None)
+    saved = context.user_data.get("старт")
+
+    if saved:
+        await update.message.reply_text(
+            "👋 С возвращением!\n"
+            "Стартовая точка сохранена.\n"
+            "Стартуем снова отсюда? (да/нет)",
+        )
+        return CONFIRM_START
+    else:
+        await update.message.reply_text(
+            "👋 Привет! Я бот для оптимизации маршрутов доставки.\n\n"
+            "🚗 <b>Что я умею:</b>\n"
+            "• Строю оптимальный маршрут объезда\n"
+            "• Экономлю топливо и время курьера\n"
+            "• Показываю маршрут в Яндекс Навигаторе\n\n"
+            "📊 <b>Реальная польза:</b>\n"
+            "• Экономия 20–30% пути на каждом маршруте\n"
+            "• Чем больше доставок — тем больше экономия\n"
+            "• Курьер успевает больше заказов за день\n\n"
+            "💡 Пример: при 10 доставках в день\n"
+            "экономия может составить от 3 000 до 15 000 руб.\n"
+            "в месяц только на топливе\n\n"
+            "Яндекс Карты едут в том порядке как ты добавил точки — "
+            "я нахожу лучший порядок сам 🧠\n\n"
+            "Готов начать? 👇",
+            parse_mode="HTML",
+            reply_markup=welcome_keyboard(),
+        )
+        return WAITING_FOR_START
+
+
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("deliveries", None)
+    saved = context.user_data.get("старт")
+
+    if saved:
+        await update.message.reply_text(
+            "🔄 Новый маршрут! Точки доставки сброшены.\n\n"
+            "Стартуем снова отсюда? (да/нет)",
+        )
+        return CONFIRM_START
+    else:
+        await update.message.reply_text(
+            "🔄 Новый маршрут!\n\n"
+            "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+
+async def cmd_changehome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("deliveries", None)
+    await update.message.reply_text(
+        "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+        parse_mode="HTML",
+    )
+    return WAITING_FOR_START
+
+
+async def handle_confirm_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    text = update.message.text.strip().lower()
+    logger.info("Confirm start: got '%s' (repr: %r)", text, text)
+    if text in ("да", "yes", "д", "+", "y", "ага", "ок", "ok", "1"):
+        context.user_data["deliveries"] = []
+        logger.info(
+            "User %s confirmed start, moving to WAITING_FOR_DELIVERY",
+            update.effective_user.id,
+        )
+        await _ask_for_delivery(update, context, first=True)
+        return WAITING_FOR_DELIVERY
+    else:
+        context.user_data.pop("старт", None)
+        logger.info(
+            "User %s declined start, moving to WAITING_FOR_START",
+            update.effective_user.id,
+        )
+        await update.message.reply_text(
+            "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📖 <b>Как пользоваться ботом:</b>\n\n"
+        "1. /start — начать новый маршрут\n"
+        "2. Отправь ссылку на стартовую точку\n"
+        "3. Отправляй ссылки точек доставки по одной\n"
+        "4. Напиши <b>Готово</b> когда добавишь все точки\n"
+        "5. Получи оптимальный маршрут и ссылку в навигатор\n\n"
+        "<b>Команды:</b>\n"
+        "/new — новый маршрут (старт сохраняется)\n"
+        "/changehome — изменить стартовую точку\n"
+        "/help — эта справка\n\n" + HOW_TO_GET_LINK,
+        parse_mode="HTML",
+    )
+
+
+async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+
+    coord = await asyncio.to_thread(parse_yandex_link, text)
+    if not coord:
+        await update.message.reply_text(
+            "❌ Не смог прочитать ссылку.\n"
+            "Попробуй ещё раз — зажми место на карте,\n"
+            "нажми Поделиться и скопируй ссылку.",
+        )
+        return WAITING_FOR_START
+
+    context.user_data["старт"] = coord
+    context.user_data["старт_адрес"] = await asyncio.to_thread(
+        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
+    )
+    context.user_data["deliveries"] = []
+    context.user_data["delivery_addresses"] = []
+    context.user_data["processed_msgs"] = set()
+    await update.message.reply_text("✅ Стартовая точка сохранена!")
+    await _ask_for_delivery(update, context, first=True)
+    return WAITING_FOR_DELIVERY
+
+
+async def _ask_for_delivery(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, first: bool = False
+) -> None:
+    deliveries = context.user_data.get("deliveries", [])
+    n = len(deliveries)
+    if first:
+        await update.message.reply_text(
+            "Теперь отправляй ссылки точек доставки по одной.\n"
+            "Когда добавишь все — напиши <b>Готово</b>\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+    else:
+        addresses = context.user_data.get("delivery_addresses", [])
+        addr = addresses[n - 1] if n <= len(addresses) else f"точка {n}"
+        await update.message.reply_text(
+            f"📍 <b>{addr}</b> добавлена!\n"
+            "Отправь следующую ссылку или напиши <b>Готово</b>",
+            parse_mode="HTML",
+        )
+
+
+async def handle_delivery_link(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    msg_id = update.message.message_id
+    processed = context.user_data.setdefault("processed_msgs", set())
+    if msg_id in processed:
+        return WAITING_FOR_DELIVERY
+    processed.add(msg_id)
+    if len(processed) > 100:
+        context.user_data["processed_msgs"] = set()
+
+    text = update.message.text.strip()
+
+    if text.lower() in ("готово", "готов", "go", "done"):
+        deliveries = context.user_data.get("deliveries", [])
+        if not deliveries:
+            await update.message.reply_text(
+                "⚠️ Ты не добавил ни одной точки доставки.\nОтправь ссылку из Яндекс Карт."
+            )
+            return WAITING_FOR_DELIVERY
+        await update.message.reply_text(
+            "👥 Сколько курьеров?\n"
+            "Напиши число от 1 до 10\n\n"
+            "(1 — один оптимальный маршрут)"
+        )
+        return WAITING_FOR_COURIERS
+
+    coord = await asyncio.to_thread(parse_yandex_link, text)
+    if not coord:
+        await update.message.reply_text(
+            "❌ Не смог прочитать ссылку.\n"
+            "Попробуй ещё раз — зажми место на карте,\n"
+            "нажми Поделиться и скопируй ссылку.\n\n"
+            "Или напиши <b>Готово</b> чтобы построить маршрут из уже добавленных точек.",
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_DELIVERY
+
+    new_key = coords_key(coord)
+
+    start = context.user_data.get("старт")
+    if start and coords_key(start) == new_key:
+        await update.message.reply_text(
+            "⚠️ Это твоя стартовая точка.\nОтправь ссылку на точку доставки."
+        )
+        return WAITING_FOR_DELIVERY
+
+    deliveries = context.user_data.setdefault("deliveries", [])
+    existing_keys = {coords_key(d) for d in deliveries}
+    if new_key in existing_keys:
+        return WAITING_FOR_DELIVERY
+    if len(deliveries) >= 50:
+        await update.message.reply_text(
+            "⚠️ Максимум 50 точек доставки. Напиши <b>Готово</b> для расчёта.",
+            parse_mode="HTML",
+        )
+        logger.info("User %s hit delivery limit (50)", update.effective_user.id)
+        return WAITING_FOR_DELIVERY
+
+    address = await asyncio.to_thread(
+        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
+    )
+    deliveries.append(coord)
+    context.user_data.setdefault("delivery_addresses", []).append(address)
+    logger.info(
+        "User %s added delivery point #%d (%s), state=WAITING_FOR_DELIVERY",
+        update.effective_user.id,
+        len(deliveries),
+        address,
+    )
+    await _ask_for_delivery(update, context, first=False)
+    return WAITING_FOR_DELIVERY
+
+
+async def handle_couriers_input(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    text = update.message.text.strip()
+    try:
+        n = int(text)
+        if n < 1 or n > 10:
+            await update.message.reply_text("Напиши число от 1 до 10")
+            return WAITING_FOR_COURIERS
+    except ValueError:
+        await update.message.reply_text("Не понял. Напиши просто число, например: 3")
+        return WAITING_FOR_COURIERS
+
+    context.user_data["num_couriers"] = n
+    return await finish_route(update, context)
+
+
+async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    deliveries: list[tuple[float, float]] = context.user_data.get("deliveries", [])
+    delivery_addresses: list[str] = context.user_data.get("delivery_addresses", [])
+    num_couriers: int = context.user_data.get("num_couriers", 1)
+    start_coord = context.user_data["старт"]
+
+    status_msg = await update.message.reply_text(
+        f"⚙️ Считаю маршруты для {num_couriers} курьера(ов)..."
+    )
+
+    groups = distribute_routes(deliveries, delivery_addresses, num_couriers)
+
+    total_km_all = 0.0
+    total_min_all = 0
+    courier_blocks: list[str] = []
+
+    for courier_idx, (group_coords, group_addrs) in enumerate(groups, 1):
+        all_coords = [start_coord] + group_coords
+        route_order, total_meters = solve_tsp_with_start(all_coords)
+        total_km = total_meters / 1000
+        time_min = int(total_km / AVG_SPEED_KMH * 60)
+        total_km_all += total_km
+        total_min_all += time_min
+
+        seen: set[int] = set()
+        delivery_steps: list[int] = []
+        for i in route_order:
+            if i != 0 and i not in seen:
+                delivery_steps.append(i)
+                seen.add(i)
+
+        numbered = "\n".join(
+            f"{pos}. {group_addrs[step - 1] if 0 <= step - 1 < len(group_addrs) else f'точка {step}'}"
+            for pos, step in enumerate(delivery_steps, 1)
+        )
+
+        yandex_url = build_yandex_nav_url(all_coords, route_order)
+
+        if num_couriers == 1:
+            courier_blocks.append(
+                f"📍 <b>Оптимальный маршрут:</b>\n{numbered}\n"
+                f"🏁 Возврат на старт\n\n"
+                f"📏 Расстояние: <b>{total_km:.1f} км</b>\n"
+                f"⏱ Время: <b>{time_min} мин</b> (30 км/ч)\n"
+                f"🗺 <b>Открыть в навигаторе:</b>\n{yandex_url}"
+            )
+        else:
+            courier_blocks.append(
+                f"🚗 <b>Курьер {courier_idx}</b> — {len(group_coords)} точек:\n"
+                f"{numbered}\n"
+                f"📏 {total_km:.1f} км • ⏱ {time_min} мин\n"
+                f'🗺 <a href="{yandex_url}">Маршрут курьера {courier_idx}</a>'
+            )
+
+    # Экономия относительно случайного порядка всех точек
+    random_km = random_route_distance([start_coord] + deliveries)
+    savings_km = max(0.0, random_km - total_km_all)
+
+    if num_couriers == 1:
+        header = "🚀 Маршрут готов!\n\n"
+        footer = ""
+    else:
+        header = f"👥 Маршруты для {num_couriers} курьеров готовы!\n\n"
+        footer = (
+            f"\n\n📊 Итого: <b>{total_km_all:.1f} км</b> • <b>{total_min_all} мин</b>\n"
+        )
+
+    if savings_km > 0:
+        day_savings = round(savings_km * 12)
+        if num_couriers == 1:
+            month_savings = round(day_savings * 30)
+            year_savings = round(month_savings * 12)
+            footer += (
+                f"💰 Экономия: <b>{savings_km:.1f} км</b>\n"
+                f"⛽️ Экономия топлива:\n"
+                f"   ~{day_savings} руб. в день\n"
+                f"   ~{month_savings} руб. в месяц\n"
+                f"   ~{year_savings} руб. в год\n"
+            )
+        else:
+            footer += (
+                f"💰 Экономия: <b>{savings_km:.1f} км</b> (~{day_savings} руб/день)\n"
+            )
+
+    result = header + "\n\n".join(courier_blocks) + footer
+
+    await status_msg.edit_text(
+        result, parse_mode="HTML", reply_markup=route_done_keyboard()
+    )
+
+    if savings_km > 0:
+        saved_rub = round(savings_km * 12)
+    else:
+        saved_rub = 0
+    save_route(
+        user_id=update.effective_user.id,
+        num_couriers=num_couriers,
+        num_points=len(deliveries),
+        total_km=round(total_km_all, 2),
+        saved_km=round(savings_km, 2),
+        saved_rub=saved_rub,
+    )
+
+    context.user_data.pop("deliveries", None)
+    context.user_data.pop("delivery_addresses", None)
+    context.user_data.pop("num_couriers", None)
+    return ConversationHandler.END
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "start_route":
+        context.user_data.pop("deliveries", None)
+        await query.message.reply_text(
+            "Отправь ссылку на место старта\n"
+            "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+    elif query.data == "how_to":
+        await query.message.reply_text(
+            "📖 <b>Как пользоваться ботом:</b>\n\n"
+            "1️⃣ Нажми <b>Начать маршрут</b>\n"
+            "2️⃣ Открой Яндекс Карты\n"
+            "3️⃣ Зажми палец на точке старта\n"
+            "4️⃣ Нажми Поделиться → скопируй ссылку\n"
+            "5️⃣ Отправь ссылку боту\n"
+            "6️⃣ Повтори для каждой точки доставки\n"
+            "7️⃣ Напиши <b>Готово</b>\n"
+            "8️⃣ Получи оптимальный маршрут! 🎉\n\n"
+            "Подсказка: ссылка выглядит так:\n"
+            "<code>https://yandex.ru/maps/?whatshere...</code>",
+            parse_mode="HTML",
+            reply_markup=start_route_keyboard(),
+        )
+        return WAITING_FOR_START
+
+    elif query.data == "new":
+        context.user_data.pop("deliveries", None)
+        context.user_data.pop("delivery_addresses", None)
+        saved = context.user_data.get("старт")
+        if saved:
+            saved_addr = context.user_data.get("старт_адрес", "сохранённая точка")
+            await query.message.reply_text(
+                "🔄 Новый маршрут! Точки сброшены.\n\n"
+                f"Стартуем снова отсюда?\n"
+                f"📍 {saved_addr}\n\n"
+                "(да/нет)"
+            )
+            return CONFIRM_START
+        else:
+            await query.message.reply_text(
+                "🔄 Новый маршрут!\n\n"
+                "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+                parse_mode="HTML",
+            )
+            return WAITING_FOR_START
+
+    elif query.data == "changehome":
+        context.user_data.pop("deliveries", None)
+        await query.message.reply_text(
+            "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
+
+    elif query.data == "stats":
+        await cmd_stats_inner(query.message, update.effective_user.id)
+        return
+
+    elif query.data == "help":
+        await query.message.reply_text(
+            "📖 <b>Как пользоваться ботом:</b>\n\n"
+            "1. /start — начать новый маршрут\n"
+            "2. Отправь ссылку стартовой точки из Яндекс Карт\n"
+            "3. Отправляй ссылки точек доставки по одной\n"
+            "4. Напиши <b>Готово</b> — получи оптимальный маршрут\n\n"
+            "<b>Команды:</b>\n"
+            "/new — новый маршрут (старт сохраняется)\n"
+            "/changehome — изменить стартовую точку\n"
+            "/help — эта справка\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+def init_db() -> None:
+    conn = sqlite3.connect("routes.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            date TEXT,
+            num_couriers INTEGER,
+            num_points INTEGER,
+            total_km REAL,
+            saved_km REAL,
+            saved_rub INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
-# --- Geocoding & Parser ---
-geocode_cache = {}
 
-def get_address(lat, lon):
-    key = f"{round(lat, 4)},{round(lon, 4)}"
-    if key in geocode_cache: return geocode_cache[key]
-
-    if YANDEX_KEY:
-        try:
-            url = f"https://geocode-maps.yandex.ru/1.x/?apikey={YANDEX_KEY}&geocode={lon},{lat}&format=json&results=1&lang=ru_RU"
-            with urllib.request.urlopen(url, timeout=3) as r:
-                data = json.loads(r.read().decode("utf-8"))
-                members = data.get("response", {}).get("GeoObjectCollection", {}).get("featureMember", [])
-                if members:
-                    name = members[0].get("GeoObject", {}).get("metaDataProperty", {}).get("GeocoderMetaData", {}).get("text", "")
-                    res = ", ".join(name.split(", ")[-2:]) if len(name.split(", ")) >= 2 else name
-                    geocode_cache[key] = res
-                    return res
-        except: pass
-
-    try:
-        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&accept-language=ru"
-        req = urllib.request.Request(url, headers={"User-Agent": "DeliveryBot/2.0"})
-        with urllib.request.urlopen(req, timeout=2) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            addr = data.get("address", {})
-            res = f"{addr.get('road', '')}, {addr.get('house_number', '')}".strip(", ")
-            if not res: res = data.get("display_name", "").split(",")[0]
-            geocode_cache[key] = res
-            return res
-    except: pass
-    return f"{lat:.5f}, {lon:.5f}"
-
-def expand_short_url(url):
-    if "maps/-/" not in url: return url
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        return urllib.request.build_opener(urllib.request.HTTPRedirectHandler()).open(req, timeout=5).geturl()
-    except: return url
-
-def parse_yandex_link(url):
-    try:
-        url = expand_short_url(url)
-        decoded = urllib.parse.unquote(url)
-        params = urllib.parse.parse_qs(urllib.parse.urlparse(decoded).query)
-        for key in ["whatshere[point]", "ll"]:
-            if key in params:
-                lon, lat = params[key][0].split(",")
-                return float(lat), float(lon)
-        m = re.search(r'point=([\d\.]+),([\d\.]+)', decoded)
-        if m: return float(m.group(2)), float(m.group(1))
-        if "/maps/org/" in url:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                body = r.read(500000).decode("utf-8", errors="ignore")
-                m = re.search(r'"center":\[(-?\d+\.?\d*),(-?\d+\.?\d*)\]', body)
-                if m: return float(m.group(2)), float(m.group(1))
-    except: pass
-    return None
-
-# --- Routing Engine ---
-async def get_gh_route(points, prefs):
-    if not GRAPHHOPPER_KEY: return None
-    gh_points = [[p[1], p[0]] for p in points]
-    custom_model = {"priority": [], "turn_penalty": []}
-    if prefs.get('right_turn', True):
-        custom_model["turn_penalty"].append({"if": "change_angle >= 60", "add": "150"})
-    if prefs.get('avoid_bad', True):
-        custom_model["priority"].append({"if": "surface == UNPAVED || road_class == TRACK", "multiply_by": "0.1"})
-    body = {
-        "points": gh_points, "profile": "car", "locale": "ru",
-        "instructions": False, "calc_points": False, "ch.disable": True,
-        "custom_model": custom_model
-    }
-    try:
-        url = f"https://graphhopper.com/api/1/route?key={GRAPHHOPPER_KEY}"
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method='POST')
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read().decode())
-            path = data["paths"][0]
-            return path["distance"]/1000, path["time"]/60000
-    except: return None
-
-# --- Keyboards ---
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="prefs"), InlineKeyboardButton("📊 Отчеты", callback_data="reports")],
-        [InlineKeyboardButton("📖 Помощь", callback_data="how_to")]
-    ])
-
-def route_done_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Новый маршрут", callback_data="new"), InlineKeyboardButton("🏠 Изменить старт", callback_data="changehome")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="reports")]
-    ])
-
-def prefs_kb(p):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Правые повороты: {'✅' if p.get('right_turn') else '❌'}", callback_data="toggle_rt")],
-        [InlineKeyboardButton(f"Избегать плохих дорог: {'✅' if p.get('avoid_bad') else '❌'}", callback_data="toggle_bad")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
-    ])
-
-# --- Handlers ---
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data['prefs'] = {'right_turn': True, 'avoid_bad': True}
-    await update.message.reply_text(
-        "👋 <b>Привет! Я профессиональный бот-логист.</b>\n\n"
-        "Я экономлю ваши деньги, используя алгоритмы UPS:\n"
-        "• <b>Приоритизация правых поворотов</b>\n"
-        "• <b>Исключение плохих дорог</b>\n"
-        "• <b>Бизнес-аналитика</b>\n\n"
-        "Нажми кнопку ниже, чтобы начать! 👇",
-        parse_mode="HTML", reply_markup=main_menu_kb()
+def save_route(
+    user_id: int,
+    num_couriers: int,
+    num_points: int,
+    total_km: float,
+    saved_km: float,
+    saved_rub: int,
+) -> None:
+    conn = sqlite3.connect("routes.db")
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO routes
+        (user_id, date, num_couriers, num_points, total_km, saved_km, saved_rub)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, date.today().isoformat(), num_couriers, num_points, total_km, saved_km, saved_rub),
     )
-    return WAITING_FOR_START
+    conn.commit()
+    conn.close()
 
-async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    coord = parse_yandex_link(update.message.text)
-    if coord:
-        context.user_data["старт"] = coord
-        addr = get_address(*coord)
-        await update.message.reply_text(f"📍 Старт: <b>{addr}</b>\nТеперь отправляй точки доставки. Когда закончишь — напиши <b>Готово</b>.", parse_mode="HTML")
-        return WAITING_FOR_DELIVERY
-    await update.message.reply_text("❌ Не распознал ссылку. Попробуй еще раз.")
-    return WAITING_FOR_START
 
-async def handle_delivery_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    if text in ("готово", "готов", "done", "го"):
-        if not context.user_data.get("deliveries"):
-            await update.message.reply_text("⚠️ Добавь хотя бы одну точку!")
-            return WAITING_FOR_DELIVERY
-        await update.message.reply_text("👥 Сколько курьеров? (1-10)")
-        return WAITING_FOR_COURIERS
-    coord = parse_yandex_link(update.message.text)
-    if coord:
-        context.user_data.setdefault("deliveries", []).append(coord)
-        addr = get_address(*coord)
-        context.user_data.setdefault("delivery_addresses", []).append(addr)
-        await update.message.reply_text(f"✅ Добавлено: <b>{addr}</b>\nЕще или <b>Готово</b>?", parse_mode="HTML")
-    else:
-        await update.message.reply_text("❌ Ошибка в ссылке.")
+async def cmd_stats_inner(message, user_id: int) -> None:
+    today = date.today().isoformat()
+    month = today[:7]
+
+    conn = sqlite3.connect("routes.db")
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT COUNT(*), SUM(num_points), SUM(total_km), SUM(saved_km), SUM(saved_rub)
+        FROM routes WHERE user_id=? AND date=?
+        """,
+        (user_id, today),
+    )
+    today_stats = c.fetchone()
+    c.execute(
+        """
+        SELECT COUNT(*), SUM(num_points), SUM(total_km), SUM(saved_km), SUM(saved_rub)
+        FROM routes WHERE user_id=? AND date LIKE ?
+        """,
+        (user_id, f"{month}%"),
+    )
+    month_stats = c.fetchone()
+    conn.close()
+
+    def fmt(stats) -> str:
+        if not stats or stats[0] == 0:
+            return "Нет данных"
+        return (
+            f"Маршрутов: {stats[0]}\n"
+            f"Точек доставки: {stats[1] or 0}\n"
+            f"Пробег: {(stats[2] or 0):.1f} км\n"
+            f"Экономия: {(stats[3] or 0):.1f} км\n"
+            f"В рублях: ~{stats[4] or 0} руб"
+        )
+
+    await message.reply_text(
+        f"📊 <b>Статистика</b>\n\n"
+        f"📅 <b>Сегодня:</b>\n{fmt(today_stats)}\n\n"
+        f"📆 <b>За месяц:</b>\n{fmt(month_stats)}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await cmd_stats_inner(update.message, update.effective_user.id)
+
+
+async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Используй /start чтобы начать или /help для справки."
+    )
+
+
+async def delivery_state_unknown_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Перехватывает неизвестные команды внутри WAITING_FOR_DELIVERY — не даёт выпасть из диалога."""
+    deliveries = context.user_data.get("deliveries", [])
+    logger.info(
+        "User %s sent unknown command in WAITING_FOR_DELIVERY, points so far: %d",
+        update.effective_user.id,
+        len(deliveries),
+    )
+    await update.message.reply_text(
+        f"📍 Уже добавлено точек: <b>{len(deliveries)}</b>\n"
+        "Отправь ссылку из Яндекс Карт или напиши <b>Готово</b>",
+        parse_mode="HTML",
+    )
     return WAITING_FOR_DELIVERY
 
-async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        num = int(update.message.text)
-        if not (1 <= num <= 10): raise ValueError
-    except:
-        await update.message.reply_text("Напиши число от 1 до 10.")
-        return WAITING_FOR_COURIERS
-    msg = await update.message.reply_text("⚙️ <b>Оптимизирую маршрут...</b>", parse_mode="HTML")
-    start_pt, dels, addrs, prefs = context.user_data["старт"], context.user_data["deliveries"], context.user_data["delivery_addresses"], context.user_data["prefs"]
-    chunk = len(dels) // num + (1 if len(dels)%num > 0 else 0)
-    total_km_all, blocks = 0, []
-    for i in range(num):
-        batch = dels[i*chunk : (i+1)*chunk]
-        batch_addrs = addrs[i*chunk : (i+1)*chunk]
-        if not batch: break
-        pts = [start_pt] + batch
-        n = len(pts)
-        manager = pywrapcp.RoutingIndexManager(n, 1, 0)
-        routing = pywrapcp.RoutingModel(manager)
-        def d_fn(f, t):
-            p1, p2 = pts[manager.IndexToNode(f)], pts[manager.IndexToNode(t)]
-            return int(math.hypot(p1[0]-p2[0], p1[1]-p2[1]) * 100000)
-        routing.SetArcCostEvaluatorOfAllVehicles(routing.RegisterTransitCallback(d_fn))
-        sol = routing.SolveWithParameters(pywrapcp.DefaultRoutingSearchParameters())
-        order = []
-        if sol:
-            idx = routing.Start(0)
-            while not routing.IsEnd(idx):
-                order.append(manager.IndexToNode(idx)); idx = sol.Value(routing.NextVar(idx))
-        ordered_pts = [pts[idx] for idx in order]
-        gh_res = await get_gh_route(ordered_pts, prefs)
-        dist, _ = gh_res if gh_res else (len(batch)*3, 0)
-        total_km_all += dist
-        numbered = "\n".join([f"{j}. {batch_addrs[idx-1]}" for j, idx in enumerate(order[1:], 1)])
-        y_url = f"https://yandex.ru/maps/?rtext={'~'.join([f'{p[0]},{p[1]}' for p in ordered_pts])}&rtt=auto"
-        blocks.append(f"🚗 <b>Курьер {i+1}</b> ({dist:.1f} км):\n{numbered}\n🗺 <a href='{y_url}'>Навигатор</a>")
-    saved_rub = (len(dels) * 3.5 - total_km_all) * (AVG_FUEL_CONSUMPTION/100) * FUEL_PRICE
-    res_txt = "🚀 <b>Готово!</b>\n\n" + "\n\n".join(blocks) + f"\n\n💰 Экономия: <b>~{max(0, int(saved_rub))} руб.</b>"
-    await msg.edit_text(res_txt, parse_mode="HTML", reply_markup=route_done_kb(), disable_web_page_preview=True)
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("INSERT INTO routes (user_id, timestamp, dist, saved_rub, count) VALUES (?, ?, ?, ?, ?)", (update.effective_user.id, datetime.now().isoformat(), total_km_all, saved_rub, len(dels)))
-        conn.commit(); conn.close()
-    except: pass
-    return ConversationHandler.END
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    if query.data == "start_route":
-        await query.message.reply_text("📍 Отправь ссылку на <b>Старт</b>.", parse_mode="HTML"); return WAITING_FOR_START
-    elif query.data == "prefs":
-        p = context.user_data.setdefault('prefs', {'right_turn': True, 'avoid_bad': True})
-        await query.message.edit_text("⚙️ <b>Настройки:</b>", reply_markup=prefs_kb(p), parse_mode="HTML"); return WAITING_FOR_PREFS
-    elif query.data.startswith("toggle_"):
-        p = context.user_data['prefs']
-        if query.data == "toggle_rt": p['right_turn'] = not p['right_turn']
-        if query.data == "toggle_bad": p['avoid_bad'] = not p['avoid_bad']
-        await query.message.edit_reply_markup(reply_markup=prefs_kb(p)); return WAITING_FOR_PREFS
-    elif query.data == "reports":
-        conn = sqlite3.connect(DB_NAME); res = conn.execute("SELECT SUM(dist), SUM(saved_rub), SUM(count) FROM routes WHERE user_id = ?", (update.effective_user.id,)).fetchone(); conn.close()
-        txt = f"📊 <b>Отчеты:</b>\n\n• Пробег: {res[0]:.1f} км\n• Экономия: {int(res[1])} руб\n• Доставок: {res[2]}" if res[0] else "Нет данных."
-        await query.message.reply_text(txt, parse_mode="HTML"); return ConversationHandler.END
-    elif query.data == "back_to_main":
-        await query.message.edit_text("Меню:", reply_markup=main_menu_kb()); return WAITING_FOR_START
-    return ConversationHandler.END
-
-def main():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).persistence(PicklePersistence(filepath="bot_persistence.pkl")).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start), CallbackQueryHandler(button_handler)],
-        states={
-            WAITING_FOR_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_link), CallbackQueryHandler(button_handler)],
-            WAITING_FOR_DELIVERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link), CallbackQueryHandler(button_handler)],
-            WAITING_FOR_COURIERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_route)],
-            WAITING_FOR_PREFS: [CallbackQueryHandler(button_handler)],
-        },
-        fallbacks=[CommandHandler("start", cmd_start)],
-        name="premium_conv", persistent=True
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(
+        "Exception while handling update: %s", context.error, exc_info=context.error
     )
-    app.add_handler(conv); app.run_polling()
+
+
+def main() -> None:
+    # Завершаем предыдущий экземпляр бота, чтобы избежать 409 Conflict
+    pid_file = "/tmp/bot_route.pid"
+    if os.path.exists(pid_file):
+        try:
+            old_pid = int(open(pid_file).read().strip())
+            if old_pid != os.getpid():
+                os.kill(old_pid, signal.SIGTERM)
+                logger.info("Sent SIGTERM to old instance PID=%d", old_pid)
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN environment variable is not set")
+
+    init_db()
+
+    persistence = PicklePersistence(filepath="bot_persistence.pkl")
+    app = Application.builder().token(token).persistence(persistence).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CommandHandler("new", cmd_new),
+            CommandHandler("changehome", cmd_changehome),
+            CallbackQueryHandler(button_handler),
+        ],
+        states={
+            CONFIRM_START: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirm_start),
+            ],
+            WAITING_FOR_START: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_start_link),
+            ],
+            WAITING_FOR_DELIVERY: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_delivery_link),
+                # перехватываем любые команды внутри состояния — не выпадаем из диалога
+                MessageHandler(filters.COMMAND, delivery_state_unknown_cmd),
+            ],
+            WAITING_FOR_COURIERS: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_couriers_input),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("start", cmd_start),
+            CommandHandler("new", cmd_new),
+            CommandHandler("changehome", cmd_changehome),
+            CallbackQueryHandler(button_handler),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler),
+        ],
+        allow_reentry=True,
+        name="route_conversation",
+        persistent=True,
+    )
+
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
