@@ -1,13 +1,11 @@
 import os
 import re
 import math
-import signal
 import asyncio
 import sqlite3
 import logging
 import random
 import json
-import time
 import urllib.request
 import urllib.parse
 from datetime import date
@@ -40,14 +38,41 @@ def cache_key(lat: float, lon: float) -> str:
     return f"{round(lat, 4)},{round(lon, 4)}"
 
 
-def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
+def _get_address_sync(lat: float, lon: float, yandex_key: str | None = None) -> str:
     key = cache_key(lat, lon)
 
+    # 1. In-memory cache (fastest)
     if key in geocode_cache:
-        logger.info("Address for %s: %s (cache)", key, geocode_cache[key])
+        logger.info("Address for %s: %s (memory cache)", key, geocode_cache[key])
         return geocode_cache[key]
 
-    # Nominatim (бесплатно, приоритет)
+    # 2. SQLite persistent cache
+    try:
+        _conn = sqlite3.connect("routes.db")
+        _row = _conn.execute(
+            "SELECT address FROM address_cache WHERE cache_key=?", (key,)
+        ).fetchone()
+        _conn.close()
+        if _row:
+            geocode_cache[key] = _row[0]
+            logger.info("Address for %s: %s (sqlite cache)", key, _row[0])
+            return _row[0]
+    except Exception as _cache_err:
+        logger.warning("SQLite address cache read failed: %s", _cache_err)
+
+    def _persist(address: str) -> None:
+        try:
+            _c = sqlite3.connect("routes.db")
+            _c.execute(
+                "INSERT OR REPLACE INTO address_cache (cache_key, address) VALUES (?,?)",
+                (key, address),
+            )
+            _c.commit()
+            _c.close()
+        except Exception as _e:
+            logger.warning("SQLite address cache write failed: %s", _e)
+
+    # 3. Nominatim (бесплатно, приоритет)
     try:
         url = (
             "https://nominatim.openstreetmap.org/reverse?"
@@ -63,12 +88,13 @@ def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
         if road:
             result = f"{road}, {house}" if house else road
             geocode_cache[key] = result
+            _persist(result)
             logger.info("Address for %s: %s (nominatim)", key, result)
             return result
     except Exception as e:
         logger.warning("Nominatim failed for %s: %s", key, e)
 
-    # Яндекс (запасной)
+    # 4. Яндекс (запасной)
     if yandex_key:
         try:
             url = (
@@ -96,16 +122,26 @@ def get_address(lat: float, lon: float, yandex_key: str | None = None) -> str:
                     parts = name.split(", ")
                     result = ", ".join(parts[-2:]) if len(parts) >= 2 else name
                     geocode_cache[key] = result
+                    _persist(result)
                     logger.info("Address for %s: %s (yandex)", key, result)
                     return result
         except Exception as e:
             logger.warning("Yandex geocoder failed for %s: %s", key, e)
 
-    # Запасной — координаты
+    # 5. Запасной — координаты
     result = f"{lat:.5f}, {lon:.5f}"
     geocode_cache[key] = result
+    _persist(result)
     logger.info("Address for %s: %s (coords)", key, result)
     return result
+
+
+async def get_address(
+    lat: float,
+    lon: float,
+    yandex_key: str | None = None,
+) -> str:
+    return await asyncio.to_thread(_get_address_sync, lat, lon, yandex_key)
 
 
 WAITING_FOR_START = 1
@@ -820,8 +856,8 @@ async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return WAITING_FOR_START
 
     context.user_data["старт"] = coord
-    context.user_data["старт_адрес"] = await asyncio.to_thread(
-        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
+    context.user_data["старт_адрес"] = await get_address(
+        coord[0], coord[1], os.environ.get("YANDEX_KEY")
     )
     context.user_data["deliveries"] = []
     context.user_data["delivery_addresses"] = []
@@ -937,7 +973,7 @@ async def handle_couriers_input(
 
     context.user_data["num_couriers"] = n
 
-    prefs = get_user_preferences(update.effective_user.id)
+    prefs = await get_user_preferences(update.effective_user.id)
     prefs_lines = [
         ("✅" if prefs["avoid_bad_roads"] else "❌") + " Избегать грунтовок",
         ("✅" if prefs["avoid_narrow_roads"] else "❌") + " Избегать узких улиц",
@@ -962,7 +998,7 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return ConversationHandler.END
 
-    prefs = get_user_preferences(update.effective_user.id)
+    prefs = await get_user_preferences(update.effective_user.id)
 
     status_msg = await update.effective_message.reply_text(
         f"⚙️ Считаю маршруты для {num_couriers} курьера(ов)..."
@@ -1060,7 +1096,7 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         saved_rub = round(savings_km * 12)
     else:
         saved_rub = 0
-    save_route(
+    await save_route(
         user_id=update.effective_user.id,
         num_couriers=num_couriers,
         num_points=len(deliveries),
@@ -1200,7 +1236,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if n < 1 or n > 10:
             return WAITING_FOR_COURIERS
         context.user_data["num_couriers"] = n
-        prefs = get_user_preferences(update.effective_user.id)
+        prefs = await get_user_preferences(update.effective_user.id)
         prefs_lines = [
             ("✅" if prefs["avoid_bad_roads"] else "❌") + " Избегать грунтовок",
             ("✅" if prefs["avoid_narrow_roads"] else "❌") + " Избегать узких улиц",
@@ -1231,7 +1267,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
-def init_db() -> None:
+def _init_db_sync() -> None:
     conn = sqlite3.connect("routes.db")
     c = conn.cursor()
     c.execute("""
@@ -1255,11 +1291,22 @@ def init_db() -> None:
             prefer_right_turns INTEGER DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS address_cache (
+            cache_key TEXT PRIMARY KEY,
+            address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
 
-def get_user_preferences(user_id: int) -> dict:
+async def init_db() -> None:
+    await asyncio.to_thread(_init_db_sync)
+
+
+def _get_prefs_sync(user_id: int) -> dict:
     conn = sqlite3.connect("routes.db")
     c = conn.cursor()
     c.execute("SELECT avoid_bad_roads, avoid_narrow_roads, prefer_right_turns FROM route_preferences WHERE user_id=?", (user_id,))
@@ -1276,7 +1323,11 @@ def get_user_preferences(user_id: int) -> dict:
     }
 
 
-def update_user_preference(user_id: int, field: str, value: int) -> None:
+async def get_user_preferences(user_id: int) -> dict:
+    return await asyncio.to_thread(_get_prefs_sync, user_id)
+
+
+def _update_pref_sync(user_id: int, field: str, value: int) -> None:
     allowed = {"avoid_bad_roads", "avoid_narrow_roads", "prefer_right_turns"}
     if field not in allowed:
         return
@@ -1288,7 +1339,11 @@ def update_user_preference(user_id: int, field: str, value: int) -> None:
     conn.close()
 
 
-def save_route(
+async def update_user_preference(user_id: int, field: str, value: int) -> None:
+    await asyncio.to_thread(_update_pref_sync, user_id, field, value)
+
+
+def _save_route_sync(
     user_id: int,
     num_couriers: int,
     num_points: int,
@@ -1310,10 +1365,22 @@ def save_route(
     conn.close()
 
 
-async def cmd_stats_inner(message, user_id: int) -> None:
+async def save_route(
+    user_id: int,
+    num_couriers: int,
+    num_points: int,
+    total_km: float,
+    saved_km: float,
+    saved_rub: int,
+) -> None:
+    await asyncio.to_thread(
+        _save_route_sync, user_id, num_couriers, num_points, total_km, saved_km, saved_rub
+    )
+
+
+def _get_stats_sync(user_id: int) -> tuple:
     today = date.today().isoformat()
     month = today[:7]
-
     conn = sqlite3.connect("routes.db")
     c = conn.cursor()
     c.execute(
@@ -1333,6 +1400,11 @@ async def cmd_stats_inner(message, user_id: int) -> None:
     )
     month_stats = c.fetchone()
     conn.close()
+    return today_stats, month_stats
+
+
+async def cmd_stats_inner(message, user_id: int) -> None:
+    today_stats, month_stats = await asyncio.to_thread(_get_stats_sync, user_id)
 
     def fmt(stats) -> str:
         if not stats or stats[0] == 0:
@@ -1402,7 +1474,7 @@ def _prefs_keyboard(prefs: dict) -> InlineKeyboardMarkup:
 
 
 async def cmd_route_prefs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    prefs = get_user_preferences(update.effective_user.id)
+    prefs = await get_user_preferences(update.effective_user.id)
     await update.effective_message.reply_text(
         "⚙️ <b>Настройки маршрута</b>\n\nВыбери параметры, которые будут учитываться при построении маршрута:",
         parse_mode="HTML",
@@ -1427,9 +1499,9 @@ async def pref_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not field:
         return
 
-    prefs = get_user_preferences(user_id)
+    prefs = await get_user_preferences(user_id)
     new_val = 0 if prefs[field] else 1
-    update_user_preference(user_id, field, new_val)
+    await update_user_preference(user_id, field, new_val)
     prefs[field] = bool(new_val)
 
     await query.edit_message_text(
@@ -1447,42 +1519,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
-    # Завершаем предыдущий экземпляр бота, чтобы избежать 409 Conflict.
-    # После SIGTERM ждём, пока старый процесс действительно завершится,
-    # иначе оба экземпляра начинают polling одновременно.
-    pid_file = "/tmp/bot_route.pid"
-    if os.path.exists(pid_file):
-        try:
-            old_pid = int(open(pid_file).read().strip())
-            if old_pid != os.getpid():
-                os.kill(old_pid, signal.SIGTERM)
-                logger.info("Sent SIGTERM to old instance PID=%d", old_pid)
-                # Ждём завершения старого процесса (до 5 секунд)
-                for _ in range(10):
-                    time.sleep(0.5)
-                    try:
-                        os.kill(old_pid, 0)  # проверяем, жив ли процесс
-                    except ProcessLookupError:
-                        logger.info("Old instance PID=%d has exited", old_pid)
-                        break
-                else:
-                    # Не завершился — убиваем принудительно
-                    try:
-                        os.kill(old_pid, signal.SIGKILL)
-                        logger.warning("Force-killed old instance PID=%d", old_pid)
-                        time.sleep(0.5)
-                    except ProcessLookupError:
-                        pass
-        except (ValueError, OSError):
-            pass
-    with open(pid_file, "w") as f:
-        f.write(str(os.getpid()))
-
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN environment variable is not set")
 
-    init_db()
+    _init_db_sync()
 
     persistence = PicklePersistence(filepath="bot_persistence.pkl")
     app = Application.builder().token(token).persistence(persistence).build()
