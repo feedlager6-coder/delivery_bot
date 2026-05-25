@@ -893,6 +893,7 @@ async def handle_delivery_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     text = update.message.text.strip()
+    logger.info("handle_delivery_link called, text=%s", text[:50])
 
     if text.lower() in ("готово", "готов", "go", "done"):
         deliveries = context.user_data.get("deliveries", [])
@@ -943,9 +944,7 @@ async def handle_delivery_link(
         logger.info("User %s hit delivery limit (50)", update.effective_user.id)
         return WAITING_FOR_DELIVERY
 
-    address = await asyncio.to_thread(
-        get_address, coord[0], coord[1], os.environ.get("YANDEX_KEY")
-    )
+    address = await get_address(coord[0], coord[1], os.environ.get("YANDEX_KEY"))
     deliveries.append(coord)
     context.user_data.setdefault("delivery_addresses", []).append(address)
     logger.info(
