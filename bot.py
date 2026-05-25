@@ -150,6 +150,21 @@ def start_route_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def confirm_start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да", callback_data="restart_yes"),
+            InlineKeyboardButton("❌ Нет", callback_data="restart_no"),
+        ],
+    ])
+
+
+def finish_delivery_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Построить маршрут", callback_data="finish_points")],
+    ])
+
+
 HOW_TO_GET_LINK = (
     "Как получить ссылку из Яндекс Карт:\n"
     "1️⃣ Открой Яндекс Карты\n"
@@ -483,7 +498,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(
             "👋 С возвращением!\n"
             "Стартовая точка сохранена.\n"
-            "Стартуем снова отсюда? (да/нет)",
+            "Стартуем снова отсюда?",
+            reply_markup=confirm_start_keyboard(),
         )
         return CONFIRM_START
     else:
@@ -516,7 +532,8 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if saved:
         await update.message.reply_text(
             "🔄 Новый маршрут! Точки доставки сброшены.\n\n"
-            "Стартуем снова отсюда? (да/нет)",
+            "Стартуем снова отсюда?",
+            reply_markup=confirm_start_keyboard(),
         )
         return CONFIRM_START
     else:
@@ -609,18 +626,20 @@ async def _ask_for_delivery(
     deliveries = context.user_data.get("deliveries", [])
     n = len(deliveries)
     if first:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Теперь отправляй ссылки точек доставки по одной.\n"
-            "Когда добавишь все — напиши <b>Готово</b>\n\n" + HOW_TO_GET_LINK,
+            "Когда добавишь все — нажми кнопку или напиши <b>Готово</b>\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=finish_delivery_keyboard(),
         )
     else:
         addresses = context.user_data.get("delivery_addresses", [])
         addr = addresses[n - 1] if n <= len(addresses) else f"точка {n}"
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"📍 <b>{addr}</b> добавлена!\n"
-            "Отправь следующую ссылку или напиши <b>Готово</b>",
+            "Отправь следующую ссылку или нажми <b>Построить маршрут</b>",
             parse_mode="HTML",
+            reply_markup=finish_delivery_keyboard(),
         )
 
 
@@ -883,8 +902,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text(
                 "🔄 Новый маршрут! Точки сброшены.\n\n"
                 f"Стартуем снова отсюда?\n"
-                f"📍 {saved_addr}\n\n"
-                "(да/нет)"
+                f"📍 {saved_addr}",
+                reply_markup=confirm_start_keyboard(),
             )
             return CONFIRM_START
         else:
@@ -925,6 +944,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "open_route_prefs":
         await cmd_route_prefs(update, context)
         return
+
+    elif query.data == "finish_points":
+        deliveries = context.user_data.get("deliveries", [])
+        if not deliveries:
+            await query.message.reply_text(
+                "⚠️ Ты не добавил ни одной точки доставки.\nОтправь ссылку из Яндекс Карт."
+            )
+            return WAITING_FOR_DELIVERY
+        await query.message.reply_text(
+            "👥 Сколько курьеров?\n"
+            "Напиши число от 1 до 10\n\n"
+            "(1 — один оптимальный маршрут)"
+        )
+        return WAITING_FOR_COURIERS
+
+    elif query.data == "restart_yes":
+        context.user_data["deliveries"] = []
+        await _ask_for_delivery(update, context, first=True)
+        return WAITING_FOR_DELIVERY
+
+    elif query.data == "restart_no":
+        context.user_data.pop("старт", None)
+        await query.message.reply_text(
+            "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
+            parse_mode="HTML",
+        )
+        return WAITING_FOR_START
 
     return ConversationHandler.END
 
@@ -1101,7 +1147,7 @@ def _prefs_keyboard(prefs: dict) -> InlineKeyboardMarkup:
 
 async def cmd_route_prefs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     prefs = get_user_preferences(update.effective_user.id)
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "⚙️ <b>Настройки маршрута</b>\n\nВыбери параметры, которые будут учитываться при построении маршрута:",
         parse_mode="HTML",
         reply_markup=_prefs_keyboard(prefs),
