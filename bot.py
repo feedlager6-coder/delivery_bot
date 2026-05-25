@@ -389,8 +389,9 @@ def random_route_distance(all_coords: list[tuple[float, float]]) -> float:
 
 
 def coords_key(coord: tuple[float, float]) -> str:
-    """Ключ координаты с точностью до 3 знаков — для дедупликации."""
-    return f"{round(coord[0], 3)},{round(coord[1], 3)}"
+    """Ключ координаты с точностью до 4 знаков (~11 м) — для дедупликации.
+    4 знака вместо 3, чтобы не объединять реальные соседние адреса (~111 м)."""
+    return f"{round(coord[0], 4)},{round(coord[1], 4)}"
 
 
 def expand_short_url(url: str) -> str:
@@ -670,6 +671,7 @@ async def handle_confirm_start(
     logger.info("Confirm start: got '%s' (repr: %r)", text, text)
     if text in ("да", "yes", "д", "+", "y", "ага", "ок", "ok", "1"):
         context.user_data["deliveries"] = []
+        context.user_data["delivery_addresses"] = []
         logger.info(
             "User %s confirmed start, moving to WAITING_FOR_DELIVERY",
             update.effective_user.id,
@@ -792,6 +794,10 @@ async def handle_delivery_link(
     deliveries = context.user_data.setdefault("deliveries", [])
     existing_keys = {coords_key(d) for d in deliveries}
     if new_key in existing_keys:
+        await update.message.reply_text(
+            "⚠️ Эта точка уже добавлена.\nОтправь ссылку на другое место.",
+            reply_markup=finish_delivery_keyboard() if deliveries else None,
+        )
         return WAITING_FOR_DELIVERY
     if len(deliveries) >= 50:
         await update.message.reply_text(
@@ -1064,7 +1070,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data == "finish_points":
         deliveries = context.user_data.get("deliveries", [])
+        start_coord = context.user_data.get("старт")
         if not deliveries:
+            if not start_coord:
+                # Кнопка из старой сессии — стартовой точки и маршрута уже нет
+                await query.message.reply_text(
+                    "⚠️ Сессия устарела. Нажми /start чтобы начать новый маршрут."
+                )
+                return ConversationHandler.END
+            # Стартовая точка есть, но точки доставки не добавлены
             await query.message.reply_text(
                 "⚠️ Ты не добавил ни одной точки доставки.\nОтправь ссылку из Яндекс Карт."
             )
