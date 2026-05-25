@@ -369,6 +369,106 @@ def build_yandex_nav_url(
     return f"https://yandex.ru/maps/?rtext={points}&rtt=auto"
 
 
+def build_graphhopper_route(
+    points: list[tuple[float, float]], preferences: dict
+) -> dict | None:
+    """Request a real road route from GraphHopper for an already-ordered list of coords.
+
+    OR-Tools determines the optimal visit order; this function only computes
+    accurate road distance/duration for that fixed sequence.
+
+    Args:
+        points: (lat, lon) tuples in optimised order (including return to start).
+        preferences: dict from get_user_preferences().
+
+    Returns:
+        {"distance_km": float, "duration_minutes": float, "raw_response": dict}
+        or None on any failure (caller must fall back to haversine estimate).
+    """
+    api_key = os.environ.get("GRAPHHOPPER_API_KEY")
+    if not api_key:
+        logger.warning("GRAPHHOPPER_API_KEY not set — skipping GraphHopper routing")
+        return None
+
+    # GraphHopper API expects [lon, lat] (GeoJSON order)
+    gh_points = [[lon, lat] for lat, lon in points]
+
+    body: dict = {
+        "points": gh_points,
+        "profile": "car",
+        "locale": "ru",
+        "calc_points": False,
+        "instructions": False,
+    }
+
+    priority_rules: list[dict] = []
+
+    if preferences.get("avoid_bad_roads"):
+        priority_rules.append({
+            "if": (
+                "surface == UNPAVED || surface == GRAVEL || "
+                "surface == DIRT || surface == GROUND || road_class == TRACK"
+            ),
+            "multiply_by": "0.1",
+        })
+
+    if preferences.get("avoid_narrow_roads"):
+        priority_rules.append({
+            "if": (
+                "road_class == RESIDENTIAL || "
+                "road_class == SERVICE || road_class == LIVING_STREET"
+            ),
+            "multiply_by": "0.7",
+        })
+
+    # TODO: prefer_right_turns — GraphHopper has no native turn-preference primitive
+    # in its custom model. Proper implementation requires post-processing turn-by-turn
+    # instructions and re-scoring segments at junctions. Architectural placeholder:
+    # preferences["prefer_right_turns"] is stored in SQLite and passed here, but is
+    # not applied to routing until a suitable hook in the GH API is identified.
+
+    if priority_rules:
+        body["custom_model"] = {"priority": priority_rules, "distance_influence": 0}
+        body["ch.disable"] = True
+
+    url = f"https://graphhopper.com/api/1/route?key={api_key}"
+
+    try:
+        raw = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=raw,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "delivery-bot-1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            response = json.loads(r.read().decode("utf-8"))
+
+        path = response.get("paths", [{}])[0]
+        distance_km = path.get("distance", 0) / 1000
+        duration_minutes = path.get("time", 0) / 60000
+
+        logger.info(
+            "GraphHopper: %.1f km, %.0f min (prefs: bad_roads=%s narrow=%s right=%s)",
+            distance_km,
+            duration_minutes,
+            preferences.get("avoid_bad_roads"),
+            preferences.get("avoid_narrow_roads"),
+            preferences.get("prefer_right_turns"),
+        )
+        return {
+            "distance_km": distance_km,
+            "duration_minutes": duration_minutes,
+            "raw_response": response,
+        }
+    except Exception as e:
+        logger.warning("GraphHopper API error: %s — falling back to haversine", e)
+        return None
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("deliveries", None)
     saved = context.user_data.get("старт")
@@ -615,6 +715,8 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     num_couriers: int = context.user_data.get("num_couriers", 1)
     start_coord = context.user_data["старт"]
 
+    prefs = get_user_preferences(update.effective_user.id)
+
     status_msg = await update.message.reply_text(
         f"⚙️ Считаю маршруты для {num_couriers} курьера(ов)..."
     )
@@ -628,8 +730,18 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     for courier_idx, (group_coords, group_addrs) in enumerate(groups, 1):
         all_coords = [start_coord] + group_coords
         route_order, total_meters = solve_tsp_with_start(all_coords)
+
+        # Haversine baseline (always computed as fallback)
         total_km = total_meters / 1000
         time_min = int(total_km / AVG_SPEED_KMH * 60)
+
+        # Real road distance/duration via GraphHopper (fallback-safe)
+        ordered_coords = [all_coords[i] for i in route_order]
+        gh = await asyncio.to_thread(build_graphhopper_route, ordered_coords, prefs)
+        if gh:
+            total_km = gh["distance_km"]
+            time_min = int(gh["duration_minutes"])
+
         total_km_all += total_km
         total_min_all += time_min
 
@@ -816,6 +928,43 @@ def init_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS route_preferences (
+            user_id INTEGER PRIMARY KEY,
+            avoid_bad_roads INTEGER DEFAULT 0,
+            avoid_narrow_roads INTEGER DEFAULT 0,
+            prefer_right_turns INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_user_preferences(user_id: int) -> dict:
+    conn = sqlite3.connect("routes.db")
+    c = conn.cursor()
+    c.execute("SELECT avoid_bad_roads, avoid_narrow_roads, prefer_right_turns FROM route_preferences WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO route_preferences (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        row = (0, 0, 0)
+    conn.close()
+    return {
+        "avoid_bad_roads": bool(row[0]),
+        "avoid_narrow_roads": bool(row[1]),
+        "prefer_right_turns": bool(row[2]),
+    }
+
+
+def update_user_preference(user_id: int, field: str, value: int) -> None:
+    allowed = {"avoid_bad_roads", "avoid_narrow_roads", "prefer_right_turns"}
+    if field not in allowed:
+        return
+    conn = sqlite3.connect("routes.db")
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO route_preferences (user_id) VALUES (?)", (user_id,))
+    c.execute(f"UPDATE route_preferences SET {field}=? WHERE user_id=?", (value, user_id))
     conn.commit()
     conn.close()
 
@@ -913,6 +1062,64 @@ async def delivery_state_unknown_cmd(
     return WAITING_FOR_DELIVERY
 
 
+def _prefs_keyboard(prefs: dict) -> InlineKeyboardMarkup:
+    def label(val: bool) -> str:
+        return "✅ ON" if val else "❌ OFF"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🚧 Избегать грунтовок: {label(prefs['avoid_bad_roads'])}",
+            callback_data="pref_bad_roads",
+        )],
+        [InlineKeyboardButton(
+            f"🏘 Избегать узких улиц: {label(prefs['avoid_narrow_roads'])}",
+            callback_data="pref_narrow",
+        )],
+        [InlineKeyboardButton(
+            f"↪️ Приоритет правых поворотов: {label(prefs['prefer_right_turns'])}",
+            callback_data="pref_right_turns",
+        )],
+    ])
+
+
+async def cmd_route_prefs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    prefs = get_user_preferences(update.effective_user.id)
+    await update.message.reply_text(
+        "⚙️ <b>Настройки маршрута</b>\n\nВыбери параметры, которые будут учитываться при построении маршрута:",
+        parse_mode="HTML",
+        reply_markup=_prefs_keyboard(prefs),
+    )
+
+
+async def pref_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    data = query.data
+
+    field_map = {
+        "pref_bad_roads": "avoid_bad_roads",
+        "pref_narrow": "avoid_narrow_roads",
+        "pref_right_turns": "prefer_right_turns",
+    }
+
+    field = field_map.get(data)
+    if not field:
+        return
+
+    prefs = get_user_preferences(user_id)
+    new_val = 0 if prefs[field] else 1
+    update_user_preference(user_id, field, new_val)
+    prefs[field] = bool(new_val)
+
+    await query.edit_message_text(
+        "⚙️ <b>Настройки маршрута</b>\n\nВыбери параметры, которые будут учитываться при построении маршрута:",
+        parse_mode="HTML",
+        reply_markup=_prefs_keyboard(prefs),
+    )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(
         "Exception while handling update: %s", context.error, exc_info=context.error
@@ -984,6 +1191,8 @@ def main() -> None:
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("route_prefs", cmd_route_prefs))
+    app.add_handler(CallbackQueryHandler(pref_callback_handler, pattern="^pref_"))
     app.add_error_handler(error_handler)
 
     logger.info("Bot started")
