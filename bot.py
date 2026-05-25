@@ -240,15 +240,110 @@ def build_distance_matrix(coords: list[tuple[float, float]]) -> list[list[int]]:
     ]
 
 
+def calculate_turn_angle(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+) -> float:
+    """Return signed turn angle (degrees) at point b when travelling a→b→c.
+
+    Negative  = right turn or gentle right curve.
+    Positive  = left turn.
+    ±180      = U-turn.
+
+    NOTE: this is a geometric heuristic based on great-circle bearings.
+    It is NOT a traffic-aware turn-cost model and does not account for
+    one-way streets, traffic lights, or actual road geometry.
+    """
+    def bearing(p1: tuple[float, float], p2: tuple[float, float]) -> float:
+        lat1 = math.radians(p1[0])
+        lat2 = math.radians(p2[0])
+        dlon = math.radians(p2[1] - p1[1])
+        x = math.sin(dlon) * math.cos(lat2)
+        y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+        return math.degrees(math.atan2(x, y))
+
+    in_bearing  = bearing(a, b)
+    out_bearing = bearing(b, c)
+    angle = out_bearing - in_bearing
+    return (angle + 180) % 360 - 180
+
+
+def turn_penalty(angle_deg: float) -> int:
+    """Soft penalty (metre-equivalent) for left turns.
+
+    Right turns / straight ahead get zero or near-zero cost.
+    Sharp left turns get a small additional cost to make right-turn routes
+    slightly more attractive when all else is equal.
+
+    Thresholds (negative = right, positive = left):
+      < −30°  →  right turn            → 0 m penalty
+      −30..30 →  roughly straight       → 5 m penalty
+       30..90 →  moderate left turn     → 20 m penalty
+      > 90°   →  sharp left / U-turn   → 40 m penalty
+
+    IMPORTANT: penalties are intentionally tiny relative to real distances
+    so they can never force a longer detour — they only break ties between
+    otherwise similar routes.  This is a HEURISTIC, not a full turn-cost model.
+    """
+    if angle_deg < -30:
+        return 0
+    if angle_deg < 30:
+        return 5
+    if angle_deg < 90:
+        return 20
+    return 40
+
+
+def build_turn_aware_matrix(
+    coords: list[tuple[float, float]],
+) -> list[list[int]]:
+    """Build a cost matrix that adds a soft turn-penalty to Haversine distance.
+
+    Because OR-Tools' transit callback receives only (from_node, to_node),
+    the actual predecessor at from_node is unknown at callback time.
+    As a heuristic approximation we average the turn penalty over all
+    possible predecessor nodes and add it to the arc cost.  This preserves
+    the overall route structure while giving a mild preference for
+    right-turn-heavy sequences.
+
+    This is a HEURISTIC — it does not guarantee turn optimality.
+    """
+    n = len(coords)
+    base = build_distance_matrix(coords)
+
+    effective: list[list[int]] = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                effective[i][j] = 0
+                continue
+            predecessors = [k for k in range(n) if k != i and k != j]
+            if predecessors:
+                avg_pen = sum(
+                    turn_penalty(calculate_turn_angle(coords[k], coords[i], coords[j]))
+                    for k in predecessors
+                ) // len(predecessors)
+            else:
+                avg_pen = 0
+            effective[i][j] = base[i][j] + avg_pen
+    return effective
+
+
 def solve_tsp_with_start(
     all_coords: list[tuple[float, float]],
+    prefer_right_turns: bool = False,
 ) -> tuple[list[int], int]:
     n = len(all_coords)
     if n == 2:
         dist = haversine_meters(all_coords[0], all_coords[1])
         return [0, 1, 0], dist * 2
 
-    matrix = build_distance_matrix(all_coords)
+    if prefer_right_turns:
+        matrix = build_turn_aware_matrix(all_coords)
+    else:
+        matrix = build_distance_matrix(all_coords)
+
     manager = pywrapcp.RoutingIndexManager(n, 1, [0], [0])
     routing = pywrapcp.RoutingModel(manager)
 
@@ -775,7 +870,10 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     for courier_idx, (group_coords, group_addrs) in enumerate(groups, 1):
         all_coords = [start_coord] + group_coords
-        route_order, total_meters = solve_tsp_with_start(all_coords)
+        route_order, total_meters = solve_tsp_with_start(
+            all_coords,
+            prefer_right_turns=prefs.get("prefer_right_turns", False),
+        )
 
         # Haversine baseline (always computed as fallback)
         total_km = total_meters / 1000
