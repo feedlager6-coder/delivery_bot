@@ -136,6 +136,7 @@ def welcome_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
             [InlineKeyboardButton("📖 Как пользоваться", callback_data="how_to")],
+            [InlineKeyboardButton("⚙️ Настройки маршрута", callback_data="open_route_prefs")],
         ]
     )
 
@@ -144,6 +145,7 @@ def start_route_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🚀 Начать маршрут", callback_data="start_route")],
+            [InlineKeyboardButton("⚙️ Настройки маршрута", callback_data="open_route_prefs")],
         ]
     )
 
@@ -806,20 +808,15 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     if savings_km > 0:
         day_savings = round(savings_km * 12)
-        if num_couriers == 1:
-            month_savings = round(day_savings * 30)
-            year_savings = round(month_savings * 12)
-            footer += (
-                f"💰 Экономия: <b>{savings_km:.1f} км</b>\n"
-                f"⛽️ Экономия топлива:\n"
-                f"   ~{day_savings} руб. в день\n"
-                f"   ~{month_savings} руб. в месяц\n"
-                f"   ~{year_savings} руб. в год\n"
-            )
-        else:
-            footer += (
-                f"💰 Экономия: <b>{savings_km:.1f} км</b> (~{day_savings} руб/день)\n"
-            )
+        month_savings = round(day_savings * 30)
+        year_savings = round(month_savings * 12)
+        footer += (
+            f"💰 Экономия: <b>{savings_km:.1f} км</b>\n"
+            f"⛽️ Экономия топлива:\n"
+            f"   ~{day_savings} руб. в день\n"
+            f"   ~{month_savings} руб. в месяц\n"
+            f"   ~{year_savings} руб. в год\n"
+        )
 
     result = header + "\n\n".join(courier_blocks) + footer
 
@@ -927,7 +924,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data == "open_route_prefs":
         await cmd_route_prefs(update, context)
-        return ConversationHandler.END
+        return
 
     return ConversationHandler.END
 
