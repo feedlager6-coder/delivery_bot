@@ -160,6 +160,20 @@ def confirm_start_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def open_maps_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка под сообщением с просьбой прислать ссылку на старт.
+
+    Открывает Яндекс Карты (браузер или приложение на телефоне),
+    откуда пользователь легко может скопировать ссылку через «Поделиться».
+    """
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🗺 Открыть Яндекс Карты",
+            url="https://yandex.ru/maps/",
+        )],
+    ])
+
+
 def finish_delivery_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Построить маршрут", callback_data="finish_points")],
@@ -734,6 +748,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "🔄 Новый маршрут!\n\n"
             "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=open_maps_keyboard(),
         )
         return WAITING_FOR_START
 
@@ -743,6 +758,7 @@ async def cmd_changehome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
         parse_mode="HTML",
+        reply_markup=open_maps_keyboard(),
     )
     return WAITING_FOR_START
 
@@ -770,6 +786,7 @@ async def handle_confirm_start(
         await update.message.reply_text(
             "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=open_maps_keyboard(),
         )
         return WAITING_FOR_START
 
@@ -1078,6 +1095,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Отправь ссылку на место старта\n"
             "(склад, офис или дом)\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=open_maps_keyboard(),
         )
         return WAITING_FOR_START
 
@@ -1117,6 +1135,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "🔄 Новый маршрут!\n\n"
                 "Отправь ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
                 parse_mode="HTML",
+                reply_markup=open_maps_keyboard(),
             )
             return WAITING_FOR_START
 
@@ -1125,6 +1144,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(
             "🏠 Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=open_maps_keyboard(),
         )
         return WAITING_FOR_START
 
@@ -1204,6 +1224,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(
             "Хорошо! Отправь новую ссылку на место старта.\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=open_maps_keyboard(),
         )
         return WAITING_FOR_START
 
