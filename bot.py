@@ -7,6 +7,7 @@ import sqlite3
 import logging
 import random
 import json
+import time
 import urllib.request
 import urllib.parse
 from datetime import date
@@ -189,34 +190,81 @@ HOW_TO_GET_LINK = (
 )
 
 
+def _is_valid_coord(lat: float, lon: float) -> bool:
+    """Базовая проверка диапазона географических координат."""
+    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+
+
 def parse_yandex_link(url: str) -> tuple[float, float] | None:
+    """Парсит ссылки Яндекс Карт и возвращает (lat, lon) или None.
+
+    Поддерживаемые форматы:
+    1. whatshere[point]=lon,lat  — «Поделиться» с мобильного (самый частый)
+    2. pt=lon,lat[,iconStyle]    — булавка на десктопе / результат поиска
+    3. ll=lon,lat                — центр карты
+    4. rtext=lat,lon~…           — ссылка на маршрут (берём первую точку)
+    5. /@lat,lon,zoom            — координаты в пути URL (новый формат)
+    6. /maps/org/… или /maps/business/… — страница организации (парсим HTML)
+    7. yandex.ru/maps/-/… или yandex.com/maps/-/… — короткая ссылка (раскрывается)
+    """
     try:
+        url = url.strip()
         url = expand_short_url(url)
 
         decoded_url = urllib.parse.unquote(url)
         parsed = urllib.parse.urlparse(decoded_url)
         params = urllib.parse.parse_qs(parsed.query)
 
+        # 1. whatshere[point]=lon,lat
         if "whatshere[point]" in params:
-            lon, lat = params["whatshere[point]"][0].split(",")
-            return float(lat), float(lon)
+            raw = params["whatshere[point]"][0].split(",")
+            lon, lat = float(raw[0]), float(raw[1])
+            if _is_valid_coord(lat, lon):
+                logger.info("Link format: whatshere[point]")
+                return lat, lon
 
+        # 2. pt=lon,lat[,iconStyle]
+        if "pt" in params:
+            raw = params["pt"][0].split(",")
+            if len(raw) >= 2:
+                lon, lat = float(raw[0]), float(raw[1])
+                if _is_valid_coord(lat, lon):
+                    logger.info("Link format: pt=")
+                    return lat, lon
+
+        # 3. ll=lon,lat
         if "ll" in params:
-            lon, lat = params["ll"][0].split(",")
-            return float(lat), float(lon)
+            raw = params["ll"][0].split(",")
+            lon, lat = float(raw[0]), float(raw[1])
+            if _is_valid_coord(lat, lon):
+                logger.info("Link format: ll=")
+                return lat, lon
 
+        # 4. rtext=lat,lon~…
         if "rtext" in params:
             parts = params["rtext"][0].split("~")[0].split(",")
             if len(parts) >= 2:
-                return float(parts[0]), float(parts[1])
+                lat, lon = float(parts[0]), float(parts[1])
+                if _is_valid_coord(lat, lon):
+                    logger.info("Link format: rtext=")
+                    return lat, lon
 
-        # Запасной вариант: ссылка на организацию — извлекаем координаты из HTML
-        if "/maps/org/" in url or "/maps/org/" in decoded_url:
+        # 5. Координаты в пути URL: /@lat,lon,zoom  или  /lat,lon,zoom
+        m = re.search(r'/@?(-?\d{1,3}\.\d{3,}),(-?\d{1,3}\.\d{3,})', decoded_url)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if _is_valid_coord(lat, lon):
+                logger.info("Link format: path coordinates")
+                return lat, lon
+
+        # 6. Страница организации или бизнеса — парсим HTML
+        if re.search(r'/maps/(org|business)/', decoded_url):
             return extract_coords_from_org_page(url)
 
+        logger.warning("parse_yandex_link: no format matched for '%s'", url[:120])
         return None
     except Exception as e:
-        logger.error(f"Link parse error for '{url}': {e}")
+        logger.error("Link parse error for '%s': %s", url[:120], e)
         return None
 
 
@@ -247,9 +295,11 @@ def calculate_turn_angle(
 ) -> float:
     """Return signed turn angle (degrees) at point b when travelling a→b→c.
 
-    Negative  = right turn or gentle right curve.
-    Positive  = left turn.
-    ±180      = U-turn.
+    Uses the difference of forward azimuth bearings (clockwise from north):
+      Positive → right turn (clockwise, e.g. north → east = +90°)
+      Negative → left turn  (counter-clockwise, e.g. north → west = −90°)
+      ≈ 0      → straight ahead
+      ±180     → U-turn
 
     NOTE: this is a geometric heuristic based on great-circle bearings.
     It is NOT a traffic-aware turn-cost model and does not account for
@@ -276,21 +326,25 @@ def turn_penalty(angle_deg: float) -> int:
     Sharp left turns get a small additional cost to make right-turn routes
     slightly more attractive when all else is equal.
 
-    Thresholds (negative = right, positive = left):
-      < −30°  →  right turn            → 0 m penalty
-      −30..30 →  roughly straight       → 5 m penalty
-       30..90 →  moderate left turn     → 20 m penalty
-      > 90°   →  sharp left / U-turn   → 40 m penalty
+    Convention (matches calculate_turn_angle):
+      Positive angle → right turn (clockwise)
+      Negative angle → left turn  (counter-clockwise)
+
+    Thresholds:
+      > +30°   →  right turn            → 0 m penalty
+      −30..+30 →  roughly straight       → 5 m penalty
+      −90..−30 →  moderate left turn     → 20 m penalty
+      < −90°   →  sharp left / U-turn   → 40 m penalty
 
     IMPORTANT: penalties are intentionally tiny relative to real distances
     so they can never force a longer detour — they only break ties between
     otherwise similar routes.  This is a HEURISTIC, not a full turn-cost model.
     """
-    if angle_deg < -30:
+    if angle_deg > 30:
         return 0
-    if angle_deg < 30:
+    if angle_deg > -30:
         return 5
-    if angle_deg < 90:
+    if angle_deg > -90:
         return 20
     return 40
 
@@ -395,9 +449,41 @@ def coords_key(coord: tuple[float, float]) -> str:
 
 
 def expand_short_url(url: str) -> str:
-    """Раскрывает короткие ссылки yandex.ru/maps/-/... через GET-запрос."""
-    if "maps/-/" not in url:
+    """Раскрывает короткие и redirect-ссылки Яндекс Карт.
+
+    Обрабатывает yandex.ru/maps/-/... и yandex.com/maps/-/...
+    Следует за всеми HTTP-редиректами до финального URL.
+    """
+    if not re.search(r'yandex\.(ru|com)/maps/-/', url):
         return url
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                    "Version/16.0 Mobile/15E148 Safari/604.1"
+                )
+            },
+            method="GET",
+        )
+        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+        response = opener.open(req, timeout=10)
+        final_url = response.geturl()
+        logger.info("Expanded short link: %s → %s", url, final_url)
+        return final_url
+    except Exception as e:
+        logger.error("Failed to expand short link '%s': %s", url, e)
+        return url
+
+
+def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
+    """Извлекает координаты из страницы организации Яндекс Карт по содержимому HTML.
+
+    Последовательно пробует несколько паттернов, так как структура HTML
+    может отличаться в зависимости от типа объекта и версии страницы.
+    """
     try:
         req = urllib.request.Request(
             url,
@@ -407,35 +493,32 @@ def expand_short_url(url: str) -> str:
                     "AppleWebKit/605.1.15"
                 )
             },
-            method="GET",
-        )
-        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
-        response = opener.open(req, timeout=10)
-        final_url = response.geturl()
-        logger.info("Expanded short link: %s -> %s", url, final_url)
-        return final_url
-    except Exception as e:
-        logger.error("Failed to expand short link '%s': %s", url, e)
-        return url
-
-
-def extract_coords_from_org_page(url: str) -> tuple[float, float] | None:
-    """Извлекает координаты из страницы организации Яндекс Карт по содержимому HTML."""
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
         )
         with urllib.request.urlopen(req, timeout=10) as r:
             body = r.read(500000).decode("utf-8", errors="ignore")
-        # "center":[lon, lat] — стандартный паттерн в JSON страницы организации
-        m = re.search(r'"center":\[(-?\d+\.?\d*),(-?\d+\.?\d*)\]', body)
-        if m:
-            lon, lat = float(m.group(1)), float(m.group(2))
-            logger.info(
-                "Extracted org coords from page body: lat=%.6f lon=%.6f", lat, lon
-            )
-            return lat, lon
+
+        # Паттерны в порядке убывания надёжности
+        patterns: list[tuple[str, bool]] = [
+            # "center":[lon, lat]  — JSON внутри страницы организации
+            (r'"center":\[(-?\d+\.?\d+),(-?\d+\.?\d+)\]', False),
+            # "lon":…,"lat":…  — явные поля координат
+            (r'"lon"\s*:\s*(-?\d+\.?\d+)[^}]+"lat"\s*:\s*(-?\d+\.?\d+)', True),
+            # ll=lon,lat в query-параметрах внутри тела страницы (redirect fallback)
+            (r'[?&]ll=(-?\d+\.?\d+),(-?\d+\.?\d+)', False),
+            # "Point":{"coordinates":[lon, lat]}  — GeoJSON-стиль
+            (r'"coordinates":\[(-?\d+\.?\d+),(-?\d+\.?\d+)\]', False),
+        ]
+        for pattern, lon_first in patterns:
+            m = re.search(pattern, body)
+            if m:
+                a, b = float(m.group(1)), float(m.group(2))
+                lon, lat = (a, b) if not lon_first else (b, a)
+                if _is_valid_coord(lat, lon):
+                    logger.info(
+                        "Org page coords via pattern '%s': lat=%.6f lon=%.6f",
+                        pattern[:40], lat, lon,
+                    )
+                    return lat, lon
     except Exception as e:
         logger.warning("Failed to extract coords from org page '%s': %s", url, e)
     return None
@@ -1343,7 +1426,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
-    # Завершаем предыдущий экземпляр бота, чтобы избежать 409 Conflict
+    # Завершаем предыдущий экземпляр бота, чтобы избежать 409 Conflict.
+    # После SIGTERM ждём, пока старый процесс действительно завершится,
+    # иначе оба экземпляра начинают polling одновременно.
     pid_file = "/tmp/bot_route.pid"
     if os.path.exists(pid_file):
         try:
@@ -1351,7 +1436,23 @@ def main() -> None:
             if old_pid != os.getpid():
                 os.kill(old_pid, signal.SIGTERM)
                 logger.info("Sent SIGTERM to old instance PID=%d", old_pid)
-        except (ProcessLookupError, ValueError, OSError):
+                # Ждём завершения старого процесса (до 5 секунд)
+                for _ in range(10):
+                    time.sleep(0.5)
+                    try:
+                        os.kill(old_pid, 0)  # проверяем, жив ли процесс
+                    except ProcessLookupError:
+                        logger.info("Old instance PID=%d has exited", old_pid)
+                        break
+                else:
+                    # Не завершился — убиваем принудительно
+                    try:
+                        os.kill(old_pid, signal.SIGKILL)
+                        logger.warning("Force-killed old instance PID=%d", old_pid)
+                        time.sleep(0.5)
+                    except ProcessLookupError:
+                        pass
+        except (ValueError, OSError):
             pass
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
