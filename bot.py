@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import time
 import asyncio
 import sqlite3
 import logging
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 AVG_SPEED_KMH = 30
 
+# Путь к БД — настраивается через переменную окружения DB_PATH.
+# По умолчанию: routes.db в текущей директории (постоянный диск Replit).
+DB_PATH = os.environ.get("DB_PATH", "routes.db")
+
 geocode_cache: dict[str, str] = {}
 
 
@@ -48,7 +53,7 @@ def _get_address_sync(lat: float, lon: float, yandex_key: str | None = None) -> 
 
     # 2. SQLite persistent cache
     try:
-        _conn = sqlite3.connect("routes.db")
+        _conn = sqlite3.connect(DB_PATH)
         _row = _conn.execute(
             "SELECT address FROM address_cache WHERE cache_key=?", (key,)
         ).fetchone()
@@ -62,7 +67,7 @@ def _get_address_sync(lat: float, lon: float, yandex_key: str | None = None) -> 
 
     def _persist(address: str) -> None:
         try:
-            _c = sqlite3.connect("routes.db")
+            _c = sqlite3.connect(DB_PATH)
             _c.execute(
                 "INSERT OR REPLACE INTO address_cache (cache_key, address) VALUES (?,?)",
                 (key, address),
@@ -74,6 +79,7 @@ def _get_address_sync(lat: float, lon: float, yandex_key: str | None = None) -> 
 
     # 3. Nominatim (бесплатно, приоритет)
     try:
+        _t0 = time.perf_counter()
         url = (
             "https://nominatim.openstreetmap.org/reverse?"
             f"lat={lat}&lon={lon}"
@@ -89,14 +95,15 @@ def _get_address_sync(lat: float, lon: float, yandex_key: str | None = None) -> 
             result = f"{road}, {house}" if house else road
             geocode_cache[key] = result
             _persist(result)
-            logger.info("Address for %s: %s (nominatim)", key, result)
+            logger.info("Address for %s: %s (nominatim, %.2fs)", key, result, time.perf_counter() - _t0)
             return result
     except Exception as e:
-        logger.warning("Nominatim failed for %s: %s", key, e)
+        logger.warning("Nominatim failed for %s (%.2fs): %s", key, time.perf_counter() - _t0, e)
 
     # 4. Яндекс (запасной)
     if yandex_key:
         try:
+            _t0 = time.perf_counter()
             url = (
                 "https://geocode-maps.yandex.ru/1.x/?"
                 f"apikey={yandex_key}&geocode={lon},{lat}"
@@ -123,16 +130,16 @@ def _get_address_sync(lat: float, lon: float, yandex_key: str | None = None) -> 
                     result = ", ".join(parts[-2:]) if len(parts) >= 2 else name
                     geocode_cache[key] = result
                     _persist(result)
-                    logger.info("Address for %s: %s (yandex)", key, result)
+                    logger.info("Address for %s: %s (yandex, %.2fs)", key, result, time.perf_counter() - _t0)
                     return result
         except Exception as e:
-            logger.warning("Yandex geocoder failed for %s: %s", key, e)
+            logger.warning("Yandex geocoder failed for %s (%.2fs): %s", key, time.perf_counter() - _t0, e)
 
-    # 5. Запасной — координаты
+    # 5. Запасной — координаты (FALLBACK)
     result = f"{lat:.5f}, {lon:.5f}"
     geocode_cache[key] = result
     _persist(result)
-    logger.info("Address for %s: %s (coords)", key, result)
+    logger.warning("FALLBACK coords for %s — geocoders unavailable", key)
     return result
 
 
@@ -698,6 +705,7 @@ def build_graphhopper_route(
     url = f"https://graphhopper.com/api/1/route?key={api_key}"
 
     try:
+        _t0 = time.perf_counter()
         raw = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -716,9 +724,8 @@ def build_graphhopper_route(
         duration_minutes = path.get("time", 0) / 60000
 
         logger.info(
-            "GraphHopper: %.1f km, %.0f min (prefs: bad_roads=%s narrow=%s right=%s)",
-            distance_km,
-            duration_minutes,
+            "GraphHopper OK: %.1f km, %.0f min, %.2fs (bad_roads=%s narrow=%s right=%s)",
+            distance_km, duration_minutes, time.perf_counter() - _t0,
             preferences.get("avoid_bad_roads"),
             preferences.get("avoid_narrow_roads"),
             preferences.get("prefer_right_turns"),
@@ -729,7 +736,7 @@ def build_graphhopper_route(
             "raw_response": response,
         }
     except Exception as e:
-        logger.warning("GraphHopper API error: %s — falling back to haversine", e)
+        logger.warning("GraphHopper FALLBACK to haversine (%.2fs): %s", time.perf_counter() - _t0, e)
         return None
 
 
@@ -845,6 +852,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_start_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
+    logger.info("STATE: WAITING_FOR_START, user=%s, text=%s", update.effective_user.id, text[:40])
 
     coord = await asyncio.to_thread(parse_yandex_link, text)
     if not coord:
@@ -1014,11 +1022,23 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     total_min_all = 0
     courier_blocks: list[str] = []
 
+    user_id = update.effective_user.id
+    logger.info(
+        "finish_route START: user=%s couriers=%d points=%d",
+        user_id, num_couriers, len(deliveries),
+    )
+    _route_t0 = time.perf_counter()
+
     for courier_idx, (group_coords, group_addrs) in enumerate(groups, 1):
         all_coords = [start_coord] + group_coords
+        _tsp_t0 = time.perf_counter()
         route_order, total_meters = solve_tsp_with_start(
             all_coords,
             prefer_right_turns=prefs.get("prefer_right_turns", False),
+        )
+        logger.info(
+            "TSP courier=%d/%d points=%d solved in %.2fs",
+            courier_idx, len(groups), len(all_coords), time.perf_counter() - _tsp_t0,
         )
 
         # Haversine baseline (always computed as fallback)
@@ -1109,6 +1129,10 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         saved_rub=saved_rub,
     )
 
+    logger.info(
+        "finish_route DONE: user=%s total_km=%.1f elapsed=%.2fs",
+        update.effective_user.id, total_km_all, time.perf_counter() - _route_t0,
+    )
     context.user_data.pop("deliveries", None)
     context.user_data.pop("delivery_addresses", None)
     context.user_data.pop("num_couriers", None)
@@ -1118,6 +1142,7 @@ async def finish_route(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    logger.info("CALLBACK: user=%s data=%s", update.effective_user.id, query.data)
 
     _REMOVE_KB = {
         "start_route", "new", "changehome",
@@ -1272,7 +1297,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _init_db_sync() -> None:
-    conn = sqlite3.connect("routes.db")
+    _db_dir = os.path.dirname(DB_PATH)
+    if _db_dir:
+        os.makedirs(_db_dir, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS routes (
@@ -1323,7 +1351,7 @@ def _init_prefs_table(conn: sqlite3.Connection) -> None:
 
 
 def _get_prefs_sync(user_id: int) -> dict:
-    conn = sqlite3.connect("routes.db")
+    conn = sqlite3.connect(DB_PATH)
     try:
         _init_prefs_table(conn)
         row = conn.execute(
@@ -1354,7 +1382,7 @@ def _update_pref_sync(user_id: int, field: str, value: int) -> None:
     allowed = {"avoid_bad_roads", "avoid_narrow_roads", "prefer_right_turns"}
     if field not in allowed:
         raise ValueError(f"Unknown preference: {field}")
-    conn = sqlite3.connect("routes.db")
+    conn = sqlite3.connect(DB_PATH)
     try:
         _init_prefs_table(conn)
         conn.execute(
@@ -1382,7 +1410,7 @@ def _save_route_sync(
     saved_km: float,
     saved_rub: int,
 ) -> None:
-    conn = sqlite3.connect("routes.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         """
@@ -1412,7 +1440,7 @@ async def save_route(
 def _get_stats_sync(user_id: int) -> tuple:
     today = date.today().isoformat()
     month = today[:7]
-    conn = sqlite3.connect("routes.db")
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
         """
