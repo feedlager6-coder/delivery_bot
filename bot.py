@@ -877,6 +877,7 @@ async def _ask_for_delivery(
             "Теперь отправляй ссылки точек доставки по одной.\n"
             "После первой точки появится кнопка <b>Построить маршрут</b>\n\n" + HOW_TO_GET_LINK,
             parse_mode="HTML",
+            reply_markup=open_maps_keyboard(),
         )
     else:
         addresses = context.user_data.get("delivery_addresses", [])
@@ -893,7 +894,11 @@ async def handle_delivery_link(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     text = update.message.text.strip()
-    logger.info("handle_delivery_link called, text=%s", text[:50])
+    logger.info(
+        "STATE: WAITING_FOR_DELIVERY, user=%s, text=%s",
+        update.effective_user.id,
+        text[:30],
+    )
 
     if text.lower() in ("готово", "готов", "go", "done"):
         deliveries = context.user_data.get("deliveries", [])
@@ -1305,21 +1310,40 @@ async def init_db() -> None:
     await asyncio.to_thread(_init_db_sync)
 
 
+def _init_prefs_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id INTEGER PRIMARY KEY,
+            avoid_bad_roads INTEGER DEFAULT 0,
+            avoid_narrow_roads INTEGER DEFAULT 0,
+            prefer_right_turns INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+
+
 def _get_prefs_sync(user_id: int) -> dict:
     conn = sqlite3.connect("routes.db")
-    c = conn.cursor()
-    c.execute("SELECT avoid_bad_roads, avoid_narrow_roads, prefer_right_turns FROM route_preferences WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    if not row:
-        c.execute("INSERT INTO route_preferences (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-        row = (0, 0, 0)
-    conn.close()
-    return {
-        "avoid_bad_roads": bool(row[0]),
-        "avoid_narrow_roads": bool(row[1]),
-        "prefer_right_turns": bool(row[2]),
-    }
+    try:
+        _init_prefs_table(conn)
+        row = conn.execute(
+            "SELECT avoid_bad_roads, avoid_narrow_roads, prefer_right_turns "
+            "FROM user_preferences WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row:
+            return {
+                "avoid_bad_roads": bool(row[0]),
+                "avoid_narrow_roads": bool(row[1]),
+                "prefer_right_turns": bool(row[2]),
+            }
+        return {
+            "avoid_bad_roads": False,
+            "avoid_narrow_roads": False,
+            "prefer_right_turns": False,
+        }
+    finally:
+        conn.close()
 
 
 async def get_user_preferences(user_id: int) -> dict:
@@ -1329,13 +1353,21 @@ async def get_user_preferences(user_id: int) -> dict:
 def _update_pref_sync(user_id: int, field: str, value: int) -> None:
     allowed = {"avoid_bad_roads", "avoid_narrow_roads", "prefer_right_turns"}
     if field not in allowed:
-        return
+        raise ValueError(f"Unknown preference: {field}")
     conn = sqlite3.connect("routes.db")
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO route_preferences (user_id) VALUES (?)", (user_id,))
-    c.execute(f"UPDATE route_preferences SET {field}=? WHERE user_id=?", (value, user_id))
-    conn.commit()
-    conn.close()
+    try:
+        _init_prefs_table(conn)
+        conn.execute(
+            f"""
+            INSERT INTO user_preferences (user_id, {field})
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET {field} = ?
+            """,
+            (user_id, value, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def update_user_preference(user_id: int, field: str, value: int) -> None:
